@@ -1,6 +1,6 @@
 <?php
 /**
- * PhoenixWAF v3.4 — AWD PHP 通防
+ * PhoenixWAF v3.0 — AWD PHP 最强通防
  *
  * 部署: php waf.php --install /var/www/html [--password pass] [--key key]
  * 面板: http://host/any.php?waf_key=KEY  (需密码登录)
@@ -788,9 +788,11 @@ function pwaf_run() {
             // ── HTTP Header 层 Flag 泄露审计 ──────────────────────────────
             // ob_start 只能截获 body，header() 注入的 Flag 会漏杀
             if (function_exists('headers_list')) {
+                $default_regex = '(?:flag|ctf)\\{[A-Za-z0-9_\\-\\.!@#$%^&*()+=]{1,100}\\}';
                 $fp = !empty($cfg['flagsub_regex'])
                     ? '/' . str_replace('/', '\\/', $cfg['flagsub_regex']) . '/'
-                    : '/flag\\{[A-Za-z0-9_\\-\\.!@#$%^&*()+=]{1,100}\\}/i';
+                    : '/' . $default_regex . '/i';
+
                 $fake = (isset($cfg['fake_flag']) ? $cfg['fake_flag'] : 'flag{fake}');
                 foreach (headers_list() as $hdr) {
                     if (preg_match($fp, $hdr, $hm)) {
@@ -1493,10 +1495,12 @@ function pwaf_response_hook($out, array $cfg, $ip) {
 
     $fake = (isset($cfg['fake_flag']) ? $cfg['fake_flag'] : 'flag{fake}');
     // 支持自定义 flag 正则（用于自动提交），默认通用格式
+    $default_regex = '(?:flag|ctf)\{[A-Za-z0-9_\-\.!@#$%^&*()+=]{1,100}\}';
+
     $fp = !empty($cfg['flagsub_regex'])
         ? '/' . str_replace('/', '\/', $cfg['flagsub_regex']) . '/'
-        : '/flag\{[A-Za-z0-9_\-\.!@#$%^&*()+=]{1,100}\}/i';
-
+        : '/' . $default_regex . '/i';
+    
     // Direct flag in output
     if (preg_match($fp, $out, $flagm)) {
         // 自动提交 flag
@@ -3379,174 +3383,119 @@ function pwaf_install(array $argv) {
     if (!$pw)  { $pw  = pwaf_rand(14); echo "[*] Password: $pw\n"; }
     if (!$key) { $key = 'k' . pwaf_rand(10); echo "[*] Panel key: $key\n"; }
 
-    echo "\n  PhoenixWAF v" . PWAF_VER . " — Installing to $wr\n\n";
+    echo "\n  PhoenixWAF v" . PWAF_VER . " — Advanced Stealth Deployment to $wr\n\n";
 
-    // Create data directory — random hidden dir inside webroot
-    $rand_name = '.' . substr(md5(uniqid('pwaf', true) . random_int(0, 999999)), 0, 8);
+    // 1. 生成唯一的随机隐藏目录名 (移除 .pwaf_ptr，改用硬编码逻辑)
+    $rand_name = '.' . substr(md5(uniqid('sys', true) . random_int(0, 999999)), 0, 8);
     $datadir = $wr . '/' . $rand_name;
-    @mkdir($datadir, 0700, true);
-    // Write pointer file so waf.php can find the data dir
-    file_put_contents($wr . '/.pwaf_ptr', $rand_name, LOCK_EX);
-    echo "[+] Data directory: $datadir\n";
-    echo "[+] Pointer file: $wr/.pwaf_ptr -> $rand_name\n";
+    if (!@mkdir($datadir, 0700, true)) { echo "[!] Failed to create secure directory\n"; exit(1); }
+    echo "[+] Created hidden storage: $datadir\n";
 
-    // Copy WAF file
-    $dst = $wr . '/waf.php';
-    if (realpath(PWAF_SELF) !== realpath($dst)) {
-        if (!copy(PWAF_SELF, $dst)) { echo "[!] Cannot copy waf.php\n"; exit(1); }
-        echo "[+] waf.php → $dst\n";
-    } else { echo "[+] waf.php already in place\n"; }
+    // 2. 将自身移动并重命名至随机目录 (隐蔽化)
+    $final_waf_path = $datadir . '/common.inc.php';
+    if (!copy(PWAF_SELF, $final_waf_path)) { echo "[!] Failed to move core file\n"; exit(1); }
+    echo "[+] Core logic moved to: $final_waf_path\n";
 
-    // Build config — all data files in $datadir (outside webroot)
+    // 3. 初始化并保存配置
     $cfg = pwaf_default_cfg();
     $cfg['hash']         = password_hash($pw, PASSWORD_BCRYPT, array('cost' => 10));
     $cfg['key']          = $key;
     $cfg['datadir']      = $datadir;
-    $cfg['log']          = $datadir . '/.pwaf_log';
-    $cfg['rate_db']      = $datadir . '/.pwaf_rate';
-    $cfg['integrity_db'] = $datadir . '/.pwaf_int';
-    $cfg['backup']       = $datadir . '/.pwaf_bak.php';
+    $cfg['log']          = $datadir . '/.sess_' . substr(md5($key), 0, 6) . '_log';
+    $cfg['rate_db']      = $datadir . '/.tmp_ratelimit';
+    $cfg['integrity_db'] = $datadir . '/.tmp_integrity';
+    $cfg['backup']       = $datadir . '/.common.bak.php';
     $cfg['webroot']      = $wr;
     $cfg['enabled']      = true;
 
     file_put_contents($datadir . '/.pwaf.php', '<?php return ' . var_export($cfg, true) . ';', LOCK_EX);
-    echo "[+] Config saved: $datadir/.pwaf.php\n";
-    copy($dst, $cfg['backup']);
-    echo "[+] Backup saved: $datadir/.pwaf_bak.php\n";
-    if (!file_exists($cfg['log'])) { touch($cfg['log']); echo "[+] Log created\n"; }
+    copy($final_waf_path, $cfg['backup']);
+    echo "[+] Configuration initialized in secret directory\n";
 
-    // Scan PHP files
-    echo "\n[*] Scanning PHP files...\n";
-    $files = pwaf_php_files($wr, $dst);
-    echo "[*] Found " . count($files) . " files\n\n";
+    // 4. 扫描所有 PHP 文件
+    echo "[*] Scanning PHP files for injection...\n";
+    $files = pwaf_php_files($wr, $final_waf_path);
+    echo "[*] Found " . count($files) . " candidate files\n";
 
-    // Strategy A: .user.ini
+    // 5. 挂载策略 A: .user.ini (静默自启动)
     $ui = $wr . '/.user.ini';
     if (is_writable($wr)) {
         $ex = file_exists($ui) ? file_get_contents($ui) : '';
         if (strpos($ex, 'auto_prepend_file') === false) {
-            file_put_contents($ui, "auto_prepend_file = $dst\n" . $ex, LOCK_EX);
+            file_put_contents($ui, "auto_prepend_file = $final_waf_path\n" . $ex, LOCK_EX);
+            echo "[+] Strategy A: .user.ini updated\n";
         }
-        echo "[+] A: .user.ini (auto_prepend_file)\n";
-    } else { echo "[-] A: .user.ini not writable\n"; }
+    }
 
-    // Strategy B: .htaccess
+    // 6. 挂载策略 B: .htaccess (Apache + 静态文件保护)
     $ht = $wr . '/.htaccess';
     if (is_writable($wr)) {
-        $ex = file_exists($ht) ? file_get_contents($ht) : '';
-        if (strpos($ex, 'auto_prepend_file') === false) {
-            file_put_contents($ht, "php_value auto_prepend_file \"$dst\"\n" . $ex, LOCK_EX);
-        }
-        echo "[+] B: .htaccess (php_value auto_prepend_file)\n";
-    } else { echo "[-] B: .htaccess not writable\n"; }
-
-    // Strategy B2: ForceType — 让 flag.txt / flag 等静态文件也被 PHP 处理
-    // 这样 auto_prepend_file 才能 hook 到对这些文件的访问（watchbird 同款机制）
-    if (is_writable($wr)) {
         $ht_content = file_exists($ht) ? file_get_contents($ht) : '';
+        // 核心：增加 ForceType 保护，让访问 flag.txt 也要走 WAF
         if (strpos($ht_content, 'ForceType application/x-httpd-php') === false) {
-            $force_block = "\n# PhoenixWAF: Force PHP processing for sensitive static files\n"
-                . "<FilesMatch \"^(flag|flag\\.txt|flag\\.php|secret|secret\\.txt|\\.env|\\.env\\..*|config\\.bak|backup\\.sql|web\\.config\\.bak)$\">\n"
+            $force_block = "\n# Internal System Sync\n"
+                . "<FilesMatch \"^(flag|flag\\.txt|flag\\.php|secret|\\.env|config\\.bak|backup\\.sql)$\">\n"
                 . "    ForceType application/x-httpd-php\n"
-                . "    php_value auto_prepend_file \"$dst\"\n"
-                . "</FilesMatch>\n";
+                . "    php_value auto_prepend_file \"$final_waf_path\"\n"
+                . "</FilesMatch>\n"
+                . "php_value auto_prepend_file \"$final_waf_path\"\n"
+                . "Options -Indexes\n"; // 禁止列目录
             file_put_contents($ht, $ht_content . $force_block, LOCK_EX);
+            echo "[+] Strategy B: .htaccess updated with ForceType protection\n";
         }
-        echo "[+] B2: .htaccess ForceType (flag.txt/flag 强制 PHP 处理)\n";
     }
 
-    // Strategy C: Physical prepend
-    $tag = '<?php ' . PWAF_MARKER . ' @include_once \'' . $dst . '\'; ?>';
+    // 7. 挂载策略 C: 物理硬编码注入 (容错性最强)
+    $tag = '<?php /* @internal_handler */ @include_once "' . $final_waf_path . '"; ?>';
     $inj = 0; $skip = 0;
     foreach ($files as $f) {
-        $c = file_get_contents($f);
-        if ($c === false || strpos($c, PWAF_MARKER) !== false) { $skip++; continue; }
-        if (file_put_contents($f, $tag . "\n" . $c, LOCK_EX) !== false) $inj++;
-        else { $skip++; echo "  [!] Cannot write: $f\n"; }
+        $c = @file_get_contents($f);
+        if ($c === false || strpos($c, '@internal_handler') !== false) { $skip++; continue; }
+        // 注入到原始 <?php 标签之后
+        $new_c = preg_replace('/^<\?php/i', $tag . "\n<?php", $c, 1, $count);
+        if ($count === 0) $new_c = $tag . "\n" . $c; // 没找到标签就直接放开头
+        if (file_put_contents($f, $new_c, LOCK_EX) !== false) $inj++;
+        else $skip++;
     }
-    echo "[+] C: Physical prepend — $inj injected, $skip skipped\n";
+    echo "[+] Strategy C: Physical injection complete ($inj files)\n";
 
-    // Protect WAF files via .htaccess (ptr file + random dir + waf.php)
-    if (file_exists($ht)) {
-        $h = file_get_contents($ht);
-        if (strpos($h, 'Deny from all') === false || strpos($h, '.pwaf_ptr') === false) {
-            // Remove old protection block if any
-            $h = preg_replace('/\n?<FilesMatch[^>]*\\.pwaf[^>]*>.*?<\/FilesMatch>\n?/s', '', $h);
-            $h .= "\n<FilesMatch \"^(\\.pwaf_ptr|waf\\.php$)\">\n    Order allow,deny\n    Deny from all\n</FilesMatch>\n";
-            // Also deny access to the random data directory
-            $h .= "<DirectoryMatch \"" . preg_quote($rand_name, '"') . "\">\n    Order allow,deny\n    Deny from all\n</DirectoryMatch>\n";
-            file_put_contents($ht, $h, LOCK_EX);
-            echo "[+] .htaccess: WAF files protected (.pwaf_ptr + $rand_name)\n";
-        }
-    }
-
-    // Honeypot files
+    // 8. 建立蜜罐文件
     foreach (['flag.txt', 'flag'] as $hf) {
         $hp = $wr . '/' . $hf;
-        if (!file_exists($hp)) { file_put_contents($hp, $cfg['fake_flag']); echo "[+] Honeypot: $hp\n"; }
+        if (!file_exists($hp)) { @file_put_contents($hp, $cfg['fake_flag']); }
     }
 
-    // Integrity baseline
+    // 9. 建立初始完整性基线
     $hashes = [];
     foreach (pwaf_all_files($wr) as $f) $hashes[$f] = hash_file('sha256', $f);
     file_put_contents($cfg['integrity_db'], json_encode(['b'=>$hashes,'ts'=>time()]), LOCK_EX);
-    echo "[+] Integrity baseline: " . count($hashes) . " files\n";
 
-    // L6: inotifywait kernel file watcher (background)
+    // 10. 部署后台不死马监控 (传入随机目录)
     pwaf_deploy_watcher($wr, true);
 
-    // L7: Deploy LD_PRELOAD .so (auto-compile)
+    // 11. 部署 LD_PRELOAD
     if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
-        echo "\n";
         pwaf_deploy_ldpreload($wr);
     }
 
-    // L8: chattr +i immutable protection on core files
+    // 12. 终极防御：chattr +i 锁定 (如果权限允许)
     if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
-        echo "\n[*] Applying chattr +i immutable protection...\n";
-        $protect_files = array(
-            $dst,                                 // waf.php (in webroot)
-            $wr . '/.pwaf_ptr',                   // pointer file
-            $datadir . '/.pwaf.php',              // config (in random dir)
-            $datadir . '/.pwaf_bak.php',          // backup (in random dir)
-        );
-        // Also protect .htaccess and .user.ini if they exist
-        if (file_exists($wr . '/.htaccess'))  $protect_files[] = $wr . '/.htaccess';
-        if (file_exists($wr . '/.user.ini'))  $protect_files[] = $wr . '/.user.ini';
-        // Protect waf.so if it was deployed
-        if (file_exists($datadir . '/waf.so'))     $protect_files[] = $datadir . '/waf.so';
-        // Protect the watcher script
-        if (file_exists($datadir . '/.pwaf_watcher.sh')) $protect_files[] = $datadir . '/.pwaf_watcher.sh';
-
-        $locked = 0;
-        foreach ($protect_files as $pf) {
-            if (!file_exists($pf)) continue;
-            $ret = 0;
-            @exec('chattr +i ' . escapeshellarg($pf) . ' 2>/dev/null', $o, $ret);
-            if ($ret === 0) {
-                $locked++;
-                echo "    [+] Locked: " . basename($pf) . "\n";
-            } else {
-                echo "    [~] Skip (no root?): " . basename($pf) . "\n";
-            }
-        }
-        if ($locked > 0) {
-            echo "[+] chattr +i: $locked files locked (immutable)\n";
-            echo "[!] To modify later: chattr -i <file>\n";
-        } else {
-            echo "[~] chattr not available or no root privileges (files not locked)\n";
-            echo "    Run as root for full protection: sudo php waf.php --install $wr\n";
-        }
+        echo "[*] Locking core files...\n";
+        // 锁定：随机目录本身、WAF核心、配置文件、备份文件
+        @exec('chattr +i ' . escapeshellarg($final_waf_path) . ' 2>/dev/null');
+        @exec('chattr +i ' . escapeshellarg($datadir . '/.pwaf.php') . ' 2>/dev/null');
+        @exec('chattr +i ' . escapeshellarg($ui) . ' 2>/dev/null');
+        @exec('chattr +i ' . escapeshellarg($ht) . ' 2>/dev/null');
+        echo "[+] Core files locked with chattr +i\n";
     }
 
     echo "\n+--------------------------------------------------+\n";
-    echo "| PhoenixWAF v" . PWAF_VER . " — Installation Complete    |\n";
+    echo "| PhoenixWAF v" . PWAF_VER . " — Deployment Success      |\n";
     echo "+--------------------------------------------------+\n";
-    echo "| Panel : http://your-host/any.php?waf_key=$key\n";
-    echo "| Pass  : $pw\n";
-    echo "| Files : $inj injected\n";
+    echo "| Panel Key : $key\n";
+    echo "| Admin Pass: $pw\n";
+    echo "| Entry     : http://host/index.php?waf_key=$key\n";
     echo "+--------------------------------------------------+\n\n";
-    echo "[!] Save the password — cannot be recovered!\n\n";
 }
 
 // ── L6: inotifywait-based kernel file watcher ────────────────────────────────
@@ -3741,90 +3690,79 @@ BASH;
 }
 
 function pwaf_uninstall($wr) {
-    $wr  = rtrim(realpath($wr) ?: $wr, '/\\');
-    $dst = $wr . '/waf.php';
-    echo "[*] Uninstalling from $wr ...\n";
+    $wr = rtrim(realpath($wr) ?: $wr, '/\\');
+    echo "[*] PhoenixWAF Uninstalling from $wr ...\n";
 
-    // Resolve data directory from pointer file
-    $ptr = $wr . '/.pwaf_ptr';
-    $datadir = '';
-    if (file_exists($ptr)) {
-        $dir = trim(file_get_contents($ptr));
-        if ($dir !== '' && is_dir($wr . '/' . $dir)) {
-            $datadir = $wr . '/' . $dir;
+    // 1. 物理移除所有 PHP 文件中的注入行
+    $files = pwaf_php_files($wr, '');
+    $cleaned = 0;
+    foreach ($files as $f) {
+        $c = @file_get_contents($f);
+        if ($c !== false && strpos($c, '@internal_handler') !== false) {
+            $new_c = preg_replace('/<\?php \/\* @internal_handler \*\/ .*? \?>\n?/', '', $c);
+            if (file_put_contents($f, $new_c, LOCK_EX)) $cleaned++;
         }
     }
+    echo "[+] Cleaned $cleaned PHP files.\n";
 
-    // Remove chattr +i immutable flag before any file operations
-    if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
-        echo "[*] Removing chattr immutable flags...\n";
-        $immutable_files = array($dst, $ptr, '.htaccess', '.user.ini');
-        if ($datadir) {
-            $immutable_files[] = $datadir . '/.pwaf.php';
-            $immutable_files[] = $datadir . '/.pwaf_bak.php';
-            $immutable_files[] = $datadir . '/waf.so';
-            $immutable_files[] = $datadir . '/.pwaf_watcher.sh';
-        }
-        foreach ($immutable_files as $f) {
-            $fp = (strpos($f, '/') === 0) ? $f : $wr . '/' . $f;
-            if (file_exists($fp)) {
-                @exec('chattr -i ' . escapeshellarg($fp) . ' 2>/dev/null');
+    // 2. 自动定位并销毁所有 WAF 隐藏目录
+    $items = scandir($wr);
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') continue;
+        $target = $wr . '/' . $item;
+        
+        if (is_dir($target) && $item[0] === '.') {
+            // 检查该目录是否包含我们的配置文件特征
+            if (file_exists($target . '/.pwaf.php') || file_exists($target . '/common.inc.php')) {
+                // 移除不可更改位 (chattr -i)
+                if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
+                    @exec('chattr -Ri ' . escapeshellarg($target) . ' 2>/dev/null');
+                }
+                
+                // 杀掉该目录下的监控进程
+                $pid_f = $target . '/.pwaf_watcher.pid';
+                if (file_exists($pid_f)) {
+                    $pid = trim(file_get_contents($pid_f));
+                    if ($pid) @exec("kill -9 $pid 2>/dev/null");
+                }
+
+                // 递归删除整个目录
+                pwaf_rrmdir($target);
+                echo "[+] Destroyed WAF data directory: $item\n";
             }
         }
     }
 
-    // Kill watcher process if running
-    $pid_file = $datadir ? ($datadir . '/.pwaf_watcher.pid') : ($wr . '/.pwaf_watcher.pid');
-    if (file_exists($pid_file)) {
-        $wpid = trim(@file_get_contents($pid_file));
-        if ($wpid && is_numeric($wpid)) {
-            @exec("kill $wpid 2>/dev/null");
-            echo "[+] Stopped watcher (PID: $wpid)\n";
+    // 3. 清理可能残留的根目录孤立文件
+    foreach (['waf.php', '.pwaf_ptr', '.user.ini', '.htaccess'] as $f) {
+        $fp = $wr . '/' . $f;
+        if (file_exists($fp)) {
+            // 如果是 .user.ini 或 .htaccess，只删除我们的特定配置行
+            if ($f === '.user.ini' || $f === '.htaccess') {
+                $c = file_get_contents($fp);
+                $c = preg_replace('/.*auto_prepend_file.*waf\.php.*\n?/i', '', $c);
+                file_put_contents($fp, $c);
+            } else if ($f === 'waf.php' || $f === '.pwaf_ptr') {
+                @unlink($fp);
+            }
         }
     }
 
-    $pat = '/^<\?php \/\*PWAF\*\/ @include_once \'[^\']+\'; \?>\n?/';
-    $n   = 0;
-    foreach (pwaf_php_files($wr, '') as $f) {
-        $c = file_get_contents($f);
-        if ($c === false || strpos($c, PWAF_MARKER) === false) continue;
-        $new = preg_replace($pat, '', $c);
-        if ($new !== $c) { file_put_contents($f, $new, LOCK_EX); $n++; }
-    }
-    echo "[+] Removed prepend from $n files\n";
-    $ui = $wr . '/.user.ini';
-    if (file_exists($ui)) {
-        file_put_contents($ui, preg_replace('/^auto_prepend_file\s*=.*\n?/m', '', file_get_contents($ui)), LOCK_EX);
-        echo "[+] Cleaned .user.ini\n";
-    }
-    $ht = $wr . '/.htaccess';
-    if (file_exists($ht)) {
-        $c = preg_replace('/^php_value auto_prepend_file.*\n?/m', '', file_get_contents($ht));
-        $c = preg_replace('/<FilesMatch[^>]*>.*?<\/FilesMatch>\n?/s', '', $c);
-        $c = preg_replace('/<DirectoryMatch[^>]*>.*?<\/DirectoryMatch>\n?/s', '', $c);
-        file_put_contents($ht, $c, LOCK_EX);
-        echo "[+] Cleaned .htaccess\n";
-    }
+    echo "[+] Uninstall finished. System is clean.\n";
+}
 
-    // Remove data directory contents and directory itself
-    if ($datadir && is_dir($datadir)) {
-        $di = new DirectoryIterator($datadir);
-        foreach ($di as $item) {
-            if ($item->isDot()) continue;
-            @unlink($item->getPathname());
+// 辅助函数：递归删除目录
+function pwaf_rrmdir($dir) {
+    if (is_dir($dir)) {
+        $objects = scandir($dir);
+        foreach ($objects as $object) {
+            if ($object != "." && $object != "..") {
+                if (is_dir($dir . "/" . $object)) pwaf_rrmdir($dir . "/" . $object);
+                else @unlink($dir . "/" . $object);
+            }
         }
-        @rmdir($datadir);
-        echo "[+] Removed data directory: $datadir\n";
+        @rmdir($dir);
     }
-    // Remove pointer file
-    if (file_exists($ptr)) { @unlink($ptr); echo "[+] Removed: $ptr\n"; }
-    // Remove legacy files in webroot (backward compat cleanup)
-    foreach (array($dst, '.pwaf.php', '.pwaf_log', '.pwaf_bak.php', '.pwaf_cnt', '.pwaf_rate',
-              '.pwaf_int', '.pwaf_chk', '.pwaf_watcher.sh', '.pwaf_watcher.pid', 'waf.so') as $f) {
-        $fp = (strpos($f, '/') === 0 || strpos($f, '\\') === 0) ? $f : $wr . '/' . $f;
-        if (file_exists($fp)) { @unlink($fp); echo "[+] Removed: $fp\n"; }
-    }
-    echo "[+] Done.\n";
 }
 
 function pwaf_status($wr) {
@@ -4223,6 +4161,3 @@ CSRC_BODY;
     echo "    + remove   - prevents remove() on protected files\n";
     echo "    + truncate - prevents truncating protected files to zero\n";
 }
-
-
-
