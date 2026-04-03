@@ -1,6 +1,6 @@
 <?php
 /**
- * PhoenixWAF v3.0 — AWD PHP 通防
+ * PhoenixWAF v3.0 — AWD PHP 最强通防
  *
  * 部署: php waf.php --install /var/www/html [--password pass] [--key key]
  * 面板: http://host/any.php?waf_key=KEY  (需密码登录)
@@ -24,13 +24,48 @@ define('PWAF_VER',    '3.0.0');
 define('PWAF_MARKER', '/*PWAF*/');
 define('PWAF_SELF',   __FILE__);
 
+// ── PHP 5.x 兼容层 ───────────────────────────────────────────────────────────
+if (!function_exists('random_int')) {
+    function random_int($min, $max) { return mt_rand($min, $max); }
+}
+if (!function_exists('random_bytes')) {
+    function random_bytes($len) {
+        if (function_exists('openssl_random_pseudo_bytes')) return openssl_random_pseudo_bytes($len);
+        $r = '';
+        for ($i = 0; $i < $len; $i++) $r .= chr(mt_rand(0, 255));
+        return $r;
+    }
+}
+if (!function_exists('array_key_first')) {
+    function array_key_first(array $arr) {
+        foreach ($arr as $k => $v) return $k;
+        return null;
+    }
+}
+if (!function_exists('hash_equals')) {
+    function hash_equals($known, $user) {
+        $known = (string)$known;
+        $user  = (string)$user;
+        if (strlen($known) !== strlen($user)) return false;
+        $r = 0;
+        for ($i = 0; $i < strlen($known); $i++) $r |= ord($known[$i]) ^ ord($user[$i]);
+        return $r === 0;
+    }
+}
+if (!function_exists('password_verify')) {
+    function password_verify($password, $hash) { return crypt($password, $hash) === $hash; }
+}
+if (!function_exists('password_hash')) {
+    function password_hash($password, $algo) { $salt = substr(strtr(base64_encode(random_bytes(16)), '+', '.'), 0, 22); return crypt($password, '$2y$10$' . $salt); }
+}
+
 // ── Entry Point ───────────────────────────────────────────────────────────────
 if (PHP_SAPI === 'cli') { pwaf_cli($argv); exit(0); }
 
 // L10: 全局异常捕获 — WAF 任何错误都不能影响业务
 try {
     pwaf_run();
-} catch (Throwable $e) {
+} catch (Exception $e) {
     // 静默失败，让请求正常通过
     @error_log('[PhoenixWAF] Error: ' . $e->getMessage());
 }
@@ -39,11 +74,42 @@ try {
 // SECTION 1: CONFIG
 // =============================================================================
 
-function pwaf_cfg_path(): string {
-    return dirname(PWAF_SELF) . '/.pwaf.php';
+function pwaf_cfg_path() {
+    $wr = dirname(PWAF_SELF);
+    // 优先: 通过指针文件 .pwaf_ptr 定位随机数据目录
+    $ptr = $wr . '/.pwaf_ptr';
+    if (file_exists($ptr)) {
+        $dir = trim(file_get_contents($ptr));
+        if ($dir !== '' && file_exists($wr . '/' . $dir . '/.pwaf.php')) {
+            return $wr . '/' . $dir . '/.pwaf.php';
+        }
+    }
+    // 降级: 同目录（兼容旧安装）
+    $local = $wr . '/.pwaf.php';
+    if (file_exists($local)) return $local;
+    // 全新安装: 返回空，由 install 创建
+    return $local;
 }
 
-function &pwaf_cfg(): array {
+// 获取数据目录（config 中指定，或从指针文件推导）
+function pwaf_datadir(array $cfg) {
+    if (!empty($cfg['datadir'])) return $cfg['datadir'];
+    // 尝试从指针文件推导
+    $wr = dirname(PWAF_SELF);
+    $ptr = $wr . '/.pwaf_ptr';
+    if (file_exists($ptr)) {
+        $dir = trim(file_get_contents($ptr));
+        if ($dir !== '' && is_dir($wr . '/' . $dir)) {
+            return $wr . '/' . $dir;
+        }
+    }
+    // 降级: 配置文件所在目录
+    $cp = pwaf_cfg_path();
+    if (file_exists($cp)) return dirname($cp);
+    return $wr;
+}
+
+function &pwaf_cfg() {
     static $c = null;
     if ($c !== null) return $c;
     $p = pwaf_cfg_path();
@@ -51,16 +117,18 @@ function &pwaf_cfg(): array {
     return $c;
 }
 
-function pwaf_default_cfg(): array {
-    $base = dirname(PWAF_SELF);
+function pwaf_default_cfg() {
+    // 数据目录: webroot 内随机隐藏目录（由 install 生成并写入 .pwaf_ptr）
+    $datadir = dirname(PWAF_SELF) . '/.' . substr(md5(uniqid('pwaf', true)), 0, 8);
     return [
         'enabled'        => true,
         'key'            => 'k' . substr(md5(uniqid('', true)), 0, 10),
         'hash'           => '',                    // bcrypt of admin password
-        'log'            => $base . '/.pwaf_log',
-        'rate_db'        => $base . '/.pwaf_rate',
-        'integrity_db'   => $base . '/.pwaf_int',
-        'backup'         => $base . '/.pwaf_bak.php',
+        'datadir'        => $datadir,
+        'log'            => $datadir . '/.pwaf_log',
+        'rate_db'        => $datadir . '/.pwaf_rate',
+        'integrity_db'   => $datadir . '/.pwaf_int',
+        'backup'         => $datadir . '/.pwaf_bak.php',
         'fake_flag'      => 'flag{y0u_g0t_tr0lled_by_ph03n1x_waf}',
         'tarpit'         => 1500000,               // usleep before fake response
         'stealth'        => false,                 // 返回假 200 迷惑攻击者（AWD 比赛建议开启）
@@ -85,15 +153,22 @@ function pwaf_default_cfg(): array {
     ];
 }
 
-function pwaf_save_cfg(array $cfg): void {
-    file_put_contents(pwaf_cfg_path(), '<?php return ' . var_export($cfg, true) . ';', LOCK_EX);
+// function pwaf_save_cfg(array $cfg) {
+//     file_put_contents(pwaf_cfg_path(), '<?php return ' . var_export($cfg, true) . ';', LOCK_EX);
+// }
+function pwaf_save_cfg(array $cfg) {
+    if (!empty($cfg['datadir'])) {
+        $path = $cfg['datadir'] . '/.pwaf.php';
+    } else {
+        $path = pwaf_cfg_path();
+    }
+    file_put_contents($path, '<?php return ' . var_export($cfg, true) . ';', LOCK_EX);
 }
-
 // =============================================================================
 // SECTION 2: DETECTION PATTERNS
 // =============================================================================
 
-function pwaf_patterns(): array {
+function pwaf_patterns() {
     static $p = null;
     if ($p !== null) return $p;
     $p = [
@@ -262,7 +337,7 @@ function pwaf_patterns(): array {
 // SECTION 3: ANTI-BYPASS DECODE PIPELINE
 // =============================================================================
 
-function pwaf_decode(string $v): array {
+function pwaf_decode($v) {
     $seen = []; $queue = [$v]; $out = [];
     $max  = 25;
     while (!empty($queue) && $max-- > 0) {
@@ -285,7 +360,7 @@ function pwaf_decode(string $v): array {
     return array_unique(array_merge($out, $extra));
 }
 
-function pwaf_decode_once(string $v): array {
+function pwaf_decode_once($v) {
     $out = [];
 
     // URL decode (up to triple encoding)
@@ -367,7 +442,7 @@ function pwaf_decode_once(string $v): array {
 }
 
 // SQL comment strip + whitespace normalize
-function pwaf_norm(string $v): string {
+function pwaf_norm($v) {
     $v = preg_replace('/\/\*!?.*?\*\//s', '', $v);   // strip /**/ without space (UN/**/ION → UNION)
     $v = preg_replace('/--[^\n\r]*/', ' ', $v);
     $v = preg_replace('/#[^\n\r]*/', ' ', $v);
@@ -376,7 +451,7 @@ function pwaf_norm(string $v): string {
     return trim($v);
 }
 
-function pwaf_cp2utf8(int $cp): string {
+function pwaf_cp2utf8($cp) {
     if (function_exists('mb_chr')) return mb_chr($cp, 'UTF-8');
     if ($cp < 0x80)    return chr($cp);
     if ($cp < 0x800)   return chr(0xC0|($cp>>6))  . chr(0x80|($cp&0x3F));
@@ -384,7 +459,7 @@ function pwaf_cp2utf8(int $cp): string {
     return chr(0xF0|($cp>>18)) . chr(0x80|(($cp>>12)&0x3F)) . chr(0x80|(($cp>>6)&0x3F)) . chr(0x80|($cp&0x3F));
 }
 
-function pwaf_mb_ord(string $c): int {
+function pwaf_mb_ord($c) {
     if (function_exists('mb_ord')) return mb_ord($c, 'UTF-8');
     $b = array_values(unpack('C*', $c));
     if (count($b) === 1) return $b[0];
@@ -397,10 +472,10 @@ function pwaf_mb_ord(string $c): int {
 // SECTION 4: INPUT COLLECTION
 // =============================================================================
 
-function pwaf_inputs(): array {
+function pwaf_inputs() {
     $inputs = [];
 
-    $flat = function(array $arr, string $src, string $pfx = '') use (&$inputs, &$flat) {
+    $flat = function(array $arr, $src, $pfx = '') use (&$inputs, &$flat) {
         foreach ($arr as $k => $v) {
             $key = $pfx ? "{$pfx}[{$k}]" : (string)$k;
             if (is_array($v)) { $flat($v, $src, $key); }
@@ -408,29 +483,29 @@ function pwaf_inputs(): array {
         }
     };
 
-    $flat($_GET,    'GET');
-    $flat($_POST,   'POST');
-    $flat($_COOKIE, 'COOKIE');
+    $flat($GLOBALS['_PWAF_GET'],    'GET');
+    $flat($GLOBALS['_PWAF_POST'],   'POST');
+    $flat($GLOBALS['_PWAF_COOKIE'], 'COOKIE');
 
     // Parameter names (bypass via param name injection)
-    foreach (array_keys($_GET)  as $k) $inputs[] = ['src'=>'GET_KEY',  'key'=>'_k', 'val'=>(string)$k];
-    foreach (array_keys($_POST) as $k) $inputs[] = ['src'=>'POST_KEY', 'key'=>'_k', 'val'=>(string)$k];
+    foreach (array_keys($GLOBALS['_PWAF_GET'])  as $k) $inputs[] = ['src'=>'GET_KEY',  'key'=>'_k', 'val'=>(string)$k];
+    foreach (array_keys($GLOBALS['_PWAF_POST']) as $k) $inputs[] = ['src'=>'POST_KEY', 'key'=>'_k', 'val'=>(string)$k];
 
     // Dangerous headers — Referer 只检测 XSS/cmdi/lfi/code，不检测 SSRF（Referer 本身可以是本站地址）
     foreach (['HTTP_USER_AGENT','HTTP_X_FORWARDED_FOR','HTTP_X_REAL_IP',
               'HTTP_CF_CONNECTING_IP','HTTP_X_FORWARDED_HOST','HTTP_X_ORIGINAL_URL',
               'HTTP_X_REWRITE_URL','HTTP_VIA','HTTP_FORWARDED'] as $h) {
-        if (!empty($_SERVER[$h])) $inputs[] = ['src'=>'HDR', 'key'=>$h, 'val'=>$_SERVER[$h], 'no_ssrf'=>false];
+        if (!empty($GLOBALS['_PWAF_SERVER'][$h])) $inputs[] = ['src'=>'HDR', 'key'=>$h, 'val'=>$GLOBALS['_PWAF_SERVER'][$h], 'no_ssrf'=>false];
     }
     // Referer: skip SSRF rule (内网 Referer 是正常行为)
-    if (!empty($_SERVER['HTTP_REFERER'])) {
-        $inputs[] = ['src'=>'HDR', 'key'=>'HTTP_REFERER', 'val'=>$_SERVER['HTTP_REFERER'], 'no_ssrf'=>true];
+    if (!empty($GLOBALS['_PWAF_SERVER']['HTTP_REFERER'])) {
+        $inputs[] = ['src'=>'HDR', 'key'=>'HTTP_REFERER', 'val'=>$GLOBALS['_PWAF_SERVER']['HTTP_REFERER'], 'no_ssrf'=>true];
     }
 
     // Raw body（使用早期缓存的 _PWAF_RAW_BODY，避免重复读取 php://input）
-    $raw = $GLOBALS['_PWAF_RAW_BODY'] ?? (string)@file_get_contents('php://input');
+    $raw = (isset($GLOBALS['_PWAF_RAW_BODY']) ? $GLOBALS['_PWAF_RAW_BODY'] : (string)@file_get_contents('php://input'));
     if ($raw !== '') {
-        $ct = strtolower($_SERVER['CONTENT_TYPE'] ?? '');
+        $ct = strtolower((isset($GLOBALS['_PWAF_SERVER']['CONTENT_TYPE']) ? $GLOBALS['_PWAF_SERVER']['CONTENT_TYPE'] : ''));
         if (strpos($ct, 'application/json') !== false) {
             $j = json_decode($raw, true);
             if (is_array($j)) $flat($j, 'JSON');
@@ -442,20 +517,20 @@ function pwaf_inputs(): array {
     }
 
     // File uploads
-    foreach ($_FILES as $field => $f) {
+    foreach ($GLOBALS['_PWAF_FILES'] as $field => $f) {
         $tmps  = is_array($f['tmp_name']) ? $f['tmp_name'] : [$f['tmp_name']];
         $names = is_array($f['name'])     ? $f['name']     : [$f['name']];
         foreach ($tmps as $i => $tmp) {
             if (!$tmp || !is_uploaded_file($tmp)) continue;
-            $inputs[] = ['src'=>'FILE_NAME',    'key'=>$field, 'val'=>(string)($names[$i]??'')];
+            $inputs[] = ['src'=>'FILE_NAME',    'key'=>$field, 'val'=>(string)((isset($names[$i]) ? $names[$i] : ''))];
             $content  = @file_get_contents($tmp, false, null, 0, 8192);
             if ($content !== false) $inputs[] = ['src'=>'FILE_BODY', 'key'=>$field, 'val'=>$content];
         }
     }
 
     // Cross-param concat (split payload detection)
-    $cg = implode(' ', array_map('strval', array_values($_GET)));
-    $cp = implode(' ', array_map('strval', array_values($_POST)));
+    $cg = implode(' ', array_map('strval', array_values($GLOBALS['_PWAF_GET'])));
+    $cp = implode(' ', array_map('strval', array_values($GLOBALS['_PWAF_POST'])));
     if ($cg) $inputs[] = ['src'=>'CGET',  'key'=>'_c', 'val'=>$cg];
     if ($cp) $inputs[] = ['src'=>'CPOST', 'key'=>'_c', 'val'=>$cp];
 
@@ -466,7 +541,15 @@ function pwaf_inputs(): array {
 // SECTION 5: CORE ENGINE
 // =============================================================================
 
-function pwaf_run(): void {
+function pwaf_run() {
+    // ── 超全局变量快照（防篡改）──────────────────────────────────────────
+    // 在 WAF 入口立即冻结，后续全部读快照，防止攻击者通过代码层面污染
+    $GLOBALS['_PWAF_GET']    = $_GET;
+    $GLOBALS['_PWAF_POST']   = $_POST;
+    $GLOBALS['_PWAF_COOKIE'] = $_COOKIE;
+    $GLOBALS['_PWAF_FILES']  = $_FILES;
+    $GLOBALS['_PWAF_SERVER'] = $_SERVER;
+
     $cfg = &pwaf_cfg();
     if (empty($cfg['enabled'])) return;
 
@@ -475,20 +558,20 @@ function pwaf_run(): void {
 
     // ── 早期缓存 raw body（php://input 只能读一次）────────────────────────
     // 对于 multipart/form-data，php://input 为空，需从 $_POST+$_FILES 重建
-    $ct = strtolower($_SERVER['CONTENT_TYPE'] ?? '');
+    $ct = strtolower((isset($GLOBALS['_PWAF_SERVER']['CONTENT_TYPE']) ? $GLOBALS['_PWAF_SERVER']['CONTENT_TYPE'] : ''));
     if (strpos($ct, 'multipart/form-data') !== false) {
         // multipart 时 php://input 为空，手动重建 raw body 用于日志和转发
         $parts = [];
-        foreach ($_POST as $k => $v) {
+        foreach ($GLOBALS['_PWAF_POST'] as $k => $v) {
             if (is_array($v)) { foreach ($v as $sv) $parts[] = urlencode($k) . '[]=' . urlencode((string)$sv); }
             else $parts[] = urlencode($k) . '=' . urlencode((string)$v);
         }
-        foreach ($_FILES as $field => $f) {
+        foreach ($GLOBALS['_PWAF_FILES'] as $field => $f) {
             $names = is_array($f['name']) ? $f['name'] : [$f['name']];
             $tmps  = is_array($f['tmp_name']) ? $f['tmp_name'] : [$f['tmp_name']];
             foreach ($tmps as $i => $tmp) {
                 if ($tmp && is_uploaded_file($tmp)) {
-                    $parts[] = urlencode($field) . '=' . urlencode('[FILE:' . ($names[$i] ?? 'unknown') . ']');
+                    $parts[] = urlencode($field) . '=' . urlencode('[FILE:' . ((isset($names[$i]) ? $names[$i] : 'unknown')) . ']');
                 }
             }
         }
@@ -508,7 +591,7 @@ function pwaf_run(): void {
     }
 
     // ── Panel access ──────────────────────────────────────────────────────────
-    $key = $_GET['waf_key'] ?? $_POST['waf_key'] ?? '';
+    $key = (isset($GLOBALS['_PWAF_GET']['waf_key']) ? $GLOBALS['_PWAF_GET']['waf_key'] : (isset($GLOBALS['_PWAF_POST']['waf_key']) ? $GLOBALS['_PWAF_POST']['waf_key'] : ''));
     if ($key !== '' && !empty($cfg['key']) && hash_equals($cfg['key'], $key)) {
         pwaf_panel($cfg, $ip); exit;
     }
@@ -535,7 +618,7 @@ function pwaf_run(): void {
     }
 
     // ── L5: Honeypot paths ────────────────────────────────────────────────────
-    $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+    $uri = parse_url((isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/'), PHP_URL_PATH) ?: '/';
     foreach ($cfg['honeypots'] as $hp) {
         if ($uri === $hp || strpos($uri, $hp) === 0) {
             pwaf_log($cfg, $ip, 'honeypot', 'uri', $uri, 'honeypot');
@@ -592,7 +675,7 @@ function pwaf_run(): void {
     if (!empty($cfg['custom_rules'])) {
         foreach ($cfg['custom_rules'] as $rname => $rcfg) {
             if (empty($rcfg['enabled'])) continue;
-            $scope = $rcfg['scope'] ?? 'all';
+            $scope = (isset($rcfg['scope']) ? $rcfg['scope'] : 'all');
             $pat   = $rcfg['pat'];
             foreach ($inputs as $inp) {
                 if ($scope !== 'all' && strtolower($inp['src']) !== strtolower($scope)) continue;
@@ -613,8 +696,47 @@ function pwaf_run(): void {
 
     // ── L2: Response hook ─────────────────────────────────────────────────────
     if (!empty($rules['response'])) {
-        ob_start(function(string $out) use (&$cfg, $ip): string {
+        $GLOBALS['_PWAF_OB_FLUSHED'] = false;
+        ob_start(function($out) use (&$cfg, $ip) {
+            $GLOBALS['_PWAF_OB_FLUSHED'] = true;
             return pwaf_response_hook($out, $cfg, $ip);
+        });
+        $GLOBALS['_PWAF_OB_LEVEL'] = ob_get_level();
+
+        // 进程接管: 即使 exit()/die()/ob_end_clean() 也能截获输出
+        register_shutdown_function(function() use (&$cfg, $ip) {
+            // ── HTTP Header 层 Flag 泄露审计 ──────────────────────────────
+            // ob_start 只能截获 body，header() 注入的 Flag 会漏杀
+            if (function_exists('headers_list')) {
+                $fp = !empty($cfg['flagsub_regex'])
+                    ? '/' . str_replace('/', '\\/', $cfg['flagsub_regex']) . '/'
+                    : '/flag\\{[A-Za-z0-9_\\-\\.!@#$%^&*()+=]{1,100}\\}/i';
+                $fake = (isset($cfg['fake_flag']) ? $cfg['fake_flag'] : 'flag{fake}');
+                foreach (headers_list() as $hdr) {
+                    if (preg_match($fp, $hdr, $hm)) {
+                        pwaf_auto_submit_flag($hm[0], $cfg);
+                        pwaf_log($cfg, $ip, 'flag_leak_header', 'response_header', substr($hdr, 0, 200), 'replaced');
+                        // 移除含 Flag 的头部并替换为安全版本
+                        $colon_pos = strpos($hdr, ':');
+                        if ($colon_pos !== false) {
+                            $hdr_name = substr($hdr, 0, $colon_pos);
+                            $hdr_val  = substr($hdr, $colon_pos + 1);
+                            $safe_val = preg_replace($fp, pwaf_same_length_fake($hm[0], $fake), $hdr_val);
+                            header($hdr_name . ':' . $safe_val, true);
+                        }
+                    }
+                }
+            }
+
+            if (!empty($GLOBALS['_PWAF_OB_FLUSHED'])) return;
+            // OB 被销毁或 exit() 中断 — 收集残余输出并过滤
+            $out = '';
+            while (ob_get_level() > 0) {
+                $out = ob_get_clean() . $out;
+            }
+            if ($out !== '') {
+                echo pwaf_response_hook($out, $cfg, $ip);
+            }
         });
     }
 
@@ -623,7 +745,7 @@ function pwaf_run(): void {
 
     // ── Periodic tasks ────────────────────────────────────────────────────────
     // 每 5 秒检查一次（用时间戳文件避免并发重复执行）
-    $tf = dirname(PWAF_SELF) . '/.pwaf_chk';
+    $tf = (isset($cfg['datadir']) ? $cfg['datadir'] : dirname(PWAF_SELF)) . '/.pwaf_chk';
     $last = (int)@file_get_contents($tf);
     if (time() - $last >= 5) {
         @file_put_contents($tf, time(), LOCK_EX);
@@ -636,11 +758,11 @@ function pwaf_run(): void {
     }
 }
 
-function pwaf_ip(): string {
+function pwaf_ip() {
     // AWD 场景: 强制使用 REMOTE_ADDR，绝不信任任何可伪造的 HTTP 头
     // X-Forwarded-For / X-Real-IP / CF-Connecting-IP 全部可以被攻击者伪造
     // 用它们做 IP 判断 = 频率限制/黑名单/裁判机识别全部失效
-    $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+    $ip = (isset($GLOBALS['_PWAF_SERVER']['REMOTE_ADDR']) ? $GLOBALS['_PWAF_SERVER']['REMOTE_ADDR'] : '');
     if ($ip && filter_var($ip, FILTER_VALIDATE_IP)) return $ip;
     return '0.0.0.0';
 }
@@ -648,15 +770,15 @@ function pwaf_ip(): string {
 // ── L8: Checker IP detection ──────────────────────────────────────────────────
 // Heuristic: checker typically hits the same path repeatedly with clean requests
 // We whitelist IPs that make requests with no suspicious params
-function pwaf_checker_detect(array &$cfg, string $ip): void {
+function pwaf_checker_detect(array &$cfg, $ip) {
     // Already known
     if (in_array($ip, $cfg['checker_ips'], true)) return;
     if (in_array($ip, $cfg['blacklist'], true)) return;
 
     // Only consider IPs with no GET/POST params (checker usually hits root cleanly)
-    if (!empty($_GET) || !empty($_POST)) return;
+    if (!empty($GLOBALS['_PWAF_GET']) || !empty($GLOBALS['_PWAF_POST'])) return;
 
-    $uri = $_SERVER['REQUEST_URI'] ?? '/';
+    $uri = (isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/');
     // Checker typically hits / or /index.php
     if (!preg_match('#^/(index\.php)?(\?.*)?$#', $uri)) return;
 
@@ -669,7 +791,7 @@ function pwaf_checker_detect(array &$cfg, string $ip): void {
     // Clean old entries (> 10 min)
     $now = time();
     foreach ($data as $k => $v) {
-        if ($now - ($v['t'] ?? 0) > 600) unset($data[$k]);
+        if ($now - ((isset($v['t']) ? $v['t'] : 0)) > 600) unset($data[$k]);
     }
     if (!isset($data[$ip])) {
         $data[$ip] = ['t' => $now, 'n' => 0];
@@ -687,9 +809,9 @@ function pwaf_checker_detect(array &$cfg, string $ip): void {
 }
 
 // ── L4: Rate limiting ─────────────────────────────────────────────────────────
-function pwaf_rate_check(array &$cfg, string $ip): bool {
-    $db    = $cfg['rate_db'] ?? (dirname(PWAF_SELF) . '/.pwaf_rate');
-    $limit = (int)($cfg['rate_limit'] ?? 80);
+function pwaf_rate_check(array &$cfg, $ip) {
+    $db    = (isset($cfg['rate_db']) ? $cfg['rate_db'] : ((isset($cfg['datadir']) ? $cfg['datadir'] : dirname(PWAF_SELF)) . '/.pwaf_rate'));
+    $limit = (int)((isset($cfg['rate_limit']) ? $cfg['rate_limit'] : 80));
     $now   = time();
 
     $fp = @fopen($db, 'c+');
@@ -699,7 +821,7 @@ function pwaf_rate_check(array &$cfg, string $ip): bool {
 
     // Expire old windows
     foreach ($data as $k => $v) {
-        if ($now - ($v['s'] ?? 0) > 120) unset($data[$k]);
+        if ($now - ((isset($v['s']) ? $v['s'] : 0)) > 120) unset($data[$k]);
     }
 
     if (!isset($data[$ip]) || $now - $data[$ip]['s'] > 60) {
@@ -720,7 +842,7 @@ function pwaf_rate_check(array &$cfg, string $ip): bool {
     return false;
 }
 
-function pwaf_auto_ban(array &$cfg, string $ip): void {
+function pwaf_auto_ban(array &$cfg, $ip) {
     if (empty($cfg['auto_ban'])) return;   // 默认关闭，需在面板手动开启
     if (!in_array($ip, $cfg['blacklist'], true)
         && !in_array($ip, $cfg['checker_ips'], true)
@@ -731,20 +853,20 @@ function pwaf_auto_ban(array &$cfg, string $ip): void {
 }
 
 // ── Block / Log ───────────────────────────────────────────────────────────────
-function pwaf_block(array $cfg, string $ip, string $rule, string $param, string $payload, float $t0 = 0.0): void {
+function pwaf_block(array $cfg, $ip, $rule, $param, $payload, $t0 = 0.0) {
     pwaf_log($cfg, $ip, $rule, $param, $payload, 'block', $t0);
 
     // ── 上传拦截：伪造成功响应 ────────────────────────────────────────────────
     if ($rule === 'upload' && !empty($cfg['fake_upload'])) {
         // 备份上传的文件内容到日志目录，供取证分析
-        $backup_dir = dirname($cfg['log'] ?? PWAF_SELF) . '/.pwaf_uploads';
+        $backup_dir = dirname((isset($cfg['log']) ? $cfg['log'] : PWAF_SELF)) . '/.pwaf_uploads';
         if (!is_dir($backup_dir)) @mkdir($backup_dir, 0700, true);
-        foreach ($_FILES as $field => $f) {
+        foreach ($GLOBALS['_PWAF_FILES'] as $field => $f) {
             $tmps  = is_array($f['tmp_name']) ? $f['tmp_name'] : [$f['tmp_name']];
             $names = is_array($f['name'])     ? $f['name']     : [$f['name']];
             foreach ($tmps as $i => $tmp) {
                 if (!$tmp || !is_uploaded_file($tmp)) continue;
-                $ext = pathinfo($names[$i] ?? '', PATHINFO_EXTENSION);
+                $ext = pathinfo((isset($names[$i]) ? $names[$i] : ''), PATHINFO_EXTENSION);
                 $bk  = $backup_dir . '/' . date('md_His') . '_' . random_int(1000,9999) . '.' . $ext . '.txt';
                 @copy($tmp, $bk);
                 @unlink($tmp);
@@ -783,7 +905,7 @@ function pwaf_block(array $cfg, string $ip, string $rule, string $param, string 
 
 // ── 反指纹随机延迟 ────────────────────────────────────────────────────────────
 // 模拟正态分布的真实业务耗时，而非固定延迟（消除时间侧信道）
-function pwaf_random_delay(): void {
+function pwaf_random_delay() {
     // Box-Muller 正态分布: 均值 80ms, 标准差 40ms, 截断到 15ms-300ms
     // 模拟真实 PHP 脚本的处理时间分布
     $u1 = random_int(1, 999999) / 1000000;
@@ -796,14 +918,14 @@ function pwaf_random_delay(): void {
 
 // ── 变色龙响应引擎（隐身模式）────────────────────────────────────────────────
 // 动态生成与目标应用风格一致的假响应，消除结构化指纹
-function pwaf_chameleon_response(array $cfg, string $rule): void {
+function pwaf_chameleon_response(array $cfg, $rule) {
     // 首先尝试学习目标应用的真实响应风格
     $style = pwaf_learn_app_style($cfg);
 
-    $ct   = strtolower($_SERVER['CONTENT_TYPE'] ?? '');
-    $acc  = strtolower($_SERVER['HTTP_ACCEPT'] ?? '');
-    $ajax = !empty($_SERVER['HTTP_X_REQUESTED_WITH']) || strpos($ct, 'json') !== false || strpos($acc, 'json') !== false;
-    $uri  = $_SERVER['REQUEST_URI'] ?? '/';
+    $ct   = strtolower((isset($GLOBALS['_PWAF_SERVER']['CONTENT_TYPE']) ? $GLOBALS['_PWAF_SERVER']['CONTENT_TYPE'] : ''));
+    $acc  = strtolower((isset($GLOBALS['_PWAF_SERVER']['HTTP_ACCEPT']) ? $GLOBALS['_PWAF_SERVER']['HTTP_ACCEPT'] : ''));
+    $ajax = !empty($GLOBALS['_PWAF_SERVER']['HTTP_X_REQUESTED_WITH']) || strpos($ct, 'json') !== false || strpos($acc, 'json') !== false;
+    $uri  = (isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/');
 
     http_response_code(200);
 
@@ -865,14 +987,14 @@ function pwaf_chameleon_response(array $cfg, string $rule): void {
             // 空白页面 + 跳转（最常见的 POST 处理结果）
             function() use ($uri, $style) {
                 $base = parse_url($uri, PHP_URL_PATH) ?: '/';
-                $title = $style['title'] ?? ['首页','管理后台','系统','Home'][array_rand(['首页','管理后台','系统','Home'])];
+                $title = (isset($style['title']) ? $style['title'] : ['首页','管理后台','系统','Home'][array_rand(['首页','管理后台','系统','Home'])]);
                 return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{$title}</title>"
                      . "<meta http-equiv=\"refresh\" content=\"0;url={$base}\"></head>"
                      . "<body></body></html>";
             },
             // 极简 OK 页（不同框架的 200 空页面）
             function() use ($style) {
-                $title = $style['title'] ?? 'OK';
+                $title = (isset($style['title']) ? $style['title'] : 'OK');
                 $bodies = [
                     "<p>OK</p>",
                     "<div class=\"container\"><p>操作成功</p></div>",
@@ -886,7 +1008,7 @@ function pwaf_chameleon_response(array $cfg, string $rule): void {
             // 表单提交后的典型响应（携带随机 CSRF token）
             function() use ($style) {
                 $token = bin2hex(random_bytes(16));
-                $title = $style['title'] ?? '提交成功';
+                $title = (isset($style['title']) ? $style['title'] : '提交成功');
                 return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{$title}</title></head>"
                      . "<body><input type=\"hidden\" name=\"_token\" value=\"{$token}\"><p>提交成功</p></body></html>";
             },
@@ -909,19 +1031,19 @@ function pwaf_chameleon_response(array $cfg, string $rule): void {
 }
 
 // ── 变色龙上传响应 ────────────────────────────────────────────────────────────
-function pwaf_chameleon_upload_response(array $cfg): void {
+function pwaf_chameleon_upload_response(array $cfg) {
     pwaf_random_delay();
     http_response_code(200);
 
-    $ct = strtolower($_SERVER['CONTENT_TYPE'] ?? '');
-    $acc = strtolower($_SERVER['HTTP_ACCEPT'] ?? '');
-    $is_json = strpos($ct, 'json') !== false || strpos($acc, 'json') !== false || !empty($_SERVER['HTTP_X_REQUESTED_WITH']);
+    $ct = strtolower((isset($GLOBALS['_PWAF_SERVER']['CONTENT_TYPE']) ? $GLOBALS['_PWAF_SERVER']['CONTENT_TYPE'] : ''));
+    $acc = strtolower((isset($GLOBALS['_PWAF_SERVER']['HTTP_ACCEPT']) ? $GLOBALS['_PWAF_SERVER']['HTTP_ACCEPT'] : ''));
+    $is_json = strpos($ct, 'json') !== false || strpos($acc, 'json') !== false || !empty($GLOBALS['_PWAF_SERVER']['HTTP_X_REQUESTED_WITH']);
 
     // 动态生成假路径 — 模拟各种真实应用的上传路径格式
     $upload_dirs = ['uploads', 'upload', 'files', 'media', 'static/upload', 'data/upload', 'public/uploads',
                     'storage/app/public', 'wp-content/uploads/' . date('Y/m'), 'attachments'];
     $dir = $upload_dirs[array_rand($upload_dirs)];
-    $orig_name = $_FILES[array_key_first($_FILES) ?? 'file']['name'] ?? 'file.jpg';
+    $orig_name = (isset($GLOBALS['_PWAF_FILES'][(array_key_first($GLOBALS['_PWAF_FILES']) !== null ? array_key_first($GLOBALS['_PWAF_FILES']) : 'file')]['name']) ? $GLOBALS['_PWAF_FILES'][(array_key_first($GLOBALS['_PWAF_FILES']) !== null ? array_key_first($GLOBALS['_PWAF_FILES']) : 'file')]['name'] : 'file.jpg');
     $ext = strtolower(pathinfo($orig_name, PATHINFO_EXTENSION) ?: 'jpg');
     // 安全扩展替换（不要返回 .php 等可执行扩展）
     $safe_exts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'txt', 'pdf', 'doc', 'zip'];
@@ -1019,12 +1141,12 @@ function pwaf_chameleon_upload_response(array $cfg): void {
 
 // ── 学习目标应用风格 ─────────────────────────────────────────────────────────
 // 缓存目标应用的页面标题等特征，用于伪装响应
-function pwaf_learn_app_style(array $cfg): array {
+function pwaf_learn_app_style(array $cfg) {
     static $style = null;
     if ($style !== null) return $style;
     $style = [];
     // 尝试读取 index.php 获取页面标题
-    $wr = $cfg['webroot'] ?? dirname(PWAF_SELF);
+    $wr = (isset($cfg['webroot']) && $cfg['webroot'] !== '' ? $cfg['webroot'] : dirname(PWAF_SELF));
     foreach (['index.php', 'index.html', 'home.php'] as $idx) {
         $fp = $wr . '/' . $idx;
         if (file_exists($fp)) {
@@ -1038,11 +1160,11 @@ function pwaf_learn_app_style(array $cfg): array {
     return $style;
 }
 
-function pwaf_log(array $cfg, string $ip, string $rule, string $param, string $payload, string $action, float $t0 = 0.0): void {
-    $lp = $cfg['log'] ?? (dirname(PWAF_SELF) . '/.pwaf_log');
+function pwaf_log(array $cfg, $ip, $rule, $param, $payload, $action, $t0 = 0.0) {
+    $lp = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
     $post_body = '';
-    if (!empty($_POST)) {
-        $post_body = substr(http_build_query($_POST), 0, 300);
+    if (!empty($GLOBALS['_PWAF_POST'])) {
+        $post_body = substr(http_build_query($GLOBALS['_PWAF_POST']), 0, 300);
     } elseif (!empty($GLOBALS['_PWAF_RAW_BODY'])) {
         $post_body = substr($GLOBALS['_PWAF_RAW_BODY'], 0, 300);
     }
@@ -1050,14 +1172,14 @@ function pwaf_log(array $cfg, string $ip, string $rule, string $param, string $p
         'ts'      => time(),
         'dt'      => date('Y-m-d H:i:s'),
         'ip'      => $ip,
-        'method'  => $_SERVER['REQUEST_METHOD'] ?? 'GET',
-        'uri'     => substr($_SERVER['REQUEST_URI'] ?? '/', 0, 500),
+        'method'  => (isset($GLOBALS['_PWAF_SERVER']['REQUEST_METHOD']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] : 'GET'),
+        'uri'     => substr((isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/'), 0, 500),
         'rule'    => $rule,
         'param'   => $param,
         'payload' => substr($payload, 0, 512),
         'action'  => $action,
-        'ua'      => substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 200),
-        'referer' => substr($_SERVER['HTTP_REFERER'] ?? '', 0, 200),
+        'ua'      => substr((isset($GLOBALS['_PWAF_SERVER']['HTTP_USER_AGENT']) ? $GLOBALS['_PWAF_SERVER']['HTTP_USER_AGENT'] : ''), 0, 200),
+        'referer' => substr((isset($GLOBALS['_PWAF_SERVER']['HTTP_REFERER']) ? $GLOBALS['_PWAF_SERVER']['HTTP_REFERER'] : ''), 0, 200),
         'post'    => $post_body,
         'ms'      => $t0 > 0 ? round((microtime(true) - $t0) * 1000, 2) : 0,
     ], JSON_UNESCAPED_UNICODE) . "\n";
@@ -1077,20 +1199,20 @@ function pwaf_log(array $cfg, string $ip, string $rule, string $param, string $p
 }
 
 // 全量访问日志（正常放行的请求）
-function pwaf_access_log(array $cfg, string $ip, string $action, string $note, float $t0): void {
+function pwaf_access_log(array $cfg, $ip, $action, $note, $t0) {
     if (empty($cfg['access_log'])) return;
-    $lp = $cfg['log'] ?? (dirname(PWAF_SELF) . '/.pwaf_log');
+    $lp = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
     $al = preg_replace('/\.([^.]+)$/', '_access.$1', $lp);
     $e  = json_encode([
         'ts'     => time(),
         'dt'     => date('Y-m-d H:i:s'),
         'ip'     => $ip,
-        'method' => $_SERVER['REQUEST_METHOD'] ?? 'GET',
-        'uri'    => substr($_SERVER['REQUEST_URI'] ?? '/', 0, 500),
+        'method' => (isset($GLOBALS['_PWAF_SERVER']['REQUEST_METHOD']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] : 'GET'),
+        'uri'    => substr((isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/'), 0, 500),
         'action' => $action,
         'note'   => $note,
-        'ua'     => substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 150),
-        'referer'=> substr($_SERVER['HTTP_REFERER'] ?? '', 0, 150),
+        'ua'     => substr((isset($GLOBALS['_PWAF_SERVER']['HTTP_USER_AGENT']) ? $GLOBALS['_PWAF_SERVER']['HTTP_USER_AGENT'] : ''), 0, 150),
+        'referer'=> substr((isset($GLOBALS['_PWAF_SERVER']['HTTP_REFERER']) ? $GLOBALS['_PWAF_SERVER']['HTTP_REFERER'] : ''), 0, 150),
         'ms'     => round((microtime(true) - $t0) * 1000, 2),
     ], JSON_UNESCAPED_UNICODE) . "\n";
     // 非阻塞写入
@@ -1104,15 +1226,15 @@ function pwaf_access_log(array $cfg, string $ip, string $action, string $note, f
 
 // ── 流量转发（异步镜像，不阻塞主请求）────────────────────────────────────────
 // 支持 IP 段：CIDR (192.168.1.0/24) 或范围 (192.168.1.1-192.168.2.255)
-function pwaf_forward(array $cfg): void {
+function pwaf_forward(array $cfg) {
     if (empty($cfg['forward_enabled'])) return;
-    $targets = $cfg['forward_targets'] ?? [];
+    $targets = (isset($cfg['forward_targets']) ? $cfg['forward_targets'] : []);
     if (empty($targets)) return;
 
-    $method  = $_SERVER['REQUEST_METHOD'] ?? 'GET';
-    $uri     = $_SERVER['REQUEST_URI'] ?? '/';
+    $method  = (isset($GLOBALS['_PWAF_SERVER']['REQUEST_METHOD']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] : 'GET');
+    $uri     = (isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/');
     $headers = [];
-    foreach ($_SERVER as $k => $v) {
+    foreach ($GLOBALS['_PWAF_SERVER'] as $k => $v) {
         if (strpos($k, 'HTTP_') === 0) {
             $name = str_replace('_', '-', substr($k, 5));
             if (in_array($name, ['HOST','CONNECTION','ACCEPT-ENCODING'], true)) continue;
@@ -1120,13 +1242,13 @@ function pwaf_forward(array $cfg): void {
         }
     }
     // 使用缓存的 raw body（php://input 对 multipart 为空，此处已在 pwaf_run 中重建）
-    $body = $GLOBALS['_PWAF_RAW_BODY'] ?? '';
+    $body = (isset($GLOBALS['_PWAF_RAW_BODY']) ? $GLOBALS['_PWAF_RAW_BODY'] : '');
     // 对 multipart/form-data，使用完整的 multipart 重建（含文件内容）
-    $ct = strtolower($_SERVER['CONTENT_TYPE'] ?? '');
+    $ct = strtolower((isset($GLOBALS['_PWAF_SERVER']['CONTENT_TYPE']) ? $GLOBALS['_PWAF_SERVER']['CONTENT_TYPE'] : ''));
     if (strpos($ct, 'multipart/form-data') !== false) {
         $boundary = 'PWAF' . bin2hex(random_bytes(8));
         $parts = [];
-        foreach ($_POST as $k => $v) {
+        foreach ($GLOBALS['_PWAF_POST'] as $k => $v) {
             if (is_array($v)) {
                 foreach ($v as $sv) {
                     $parts[] = "--$boundary\r\nContent-Disposition: form-data; name=\"{$k}[]\"\r\n\r\n" . (string)$sv;
@@ -1135,14 +1257,14 @@ function pwaf_forward(array $cfg): void {
                 $parts[] = "--$boundary\r\nContent-Disposition: form-data; name=\"$k\"\r\n\r\n" . (string)$v;
             }
         }
-        foreach ($_FILES as $field => $f) {
+        foreach ($GLOBALS['_PWAF_FILES'] as $field => $f) {
             $names = is_array($f['name']) ? $f['name'] : [$f['name']];
             $types = is_array($f['type']) ? $f['type'] : [$f['type']];
             $tmps  = is_array($f['tmp_name']) ? $f['tmp_name'] : [$f['tmp_name']];
             foreach ($tmps as $i => $tmp) {
                 if (!$tmp || !is_uploaded_file($tmp)) continue;
-                $fname = $names[$i] ?? 'file';
-                $ftype = $types[$i] ?? 'application/octet-stream';
+                $fname = (isset($names[$i]) ? $names[$i] : 'file');
+                $ftype = (isset($types[$i]) ? $types[$i] : 'application/octet-stream');
                 $fcontent = @file_get_contents($tmp);
                 if ($fcontent === false) continue;
                 $parts[] = "--$boundary\r\nContent-Disposition: form-data; name=\"$field\"; filename=\"$fname\"\r\nContent-Type: $ftype\r\n\r\n$fcontent";
@@ -1150,17 +1272,22 @@ function pwaf_forward(array $cfg): void {
         }
         if ($parts) {
             $body = implode("\r\n", $parts) . "\r\n--$boundary--\r\n";
-            // 替换转发头中的 Content-Type
-            $headers = array_filter($headers, function($h) { return stripos($h, 'Content-Type:') !== 0; });
+            // 替换转发头中的 Content-Type 和 Content-Length
+            $headers = array_filter($headers, function($h) { return stripos($h, 'Content-Type:') !== 0 && stripos($h, 'Content-Length:') !== 0; });
             $headers[] = "Content-Type: multipart/form-data; boundary=$boundary";
+            $headers[] = "Content-Length: " . strlen($body);
         }
+    } elseif ($body !== '') {
+        // 非 multipart 但有 body（POST JSON 等）— 同样修正 Content-Length
+        $headers = array_filter($headers, function($h) { return stripos($h, 'Content-Length:') !== 0; });
+        $headers[] = "Content-Length: " . strlen($body);
     }
 
     foreach ($targets as $t) {
         if (empty($t['enabled'])) continue;
-        $host = trim($t['host'] ?? '');
-        $port = (int)($t['port'] ?? 80);
-        $cidr = trim($t['cidr'] ?? '');
+        $host = trim((isset($t['host']) ? $t['host'] : ''));
+        $port = (int)((isset($t['port']) ? $t['port'] : 80));
+        $cidr = trim((isset($t['cidr']) ? $t['cidr'] : ''));
         if (!$host) continue;
         // 如果设置了 IP 段限制，只转发来自该段的请求
         if ($cidr && !pwaf_ip_in_range(pwaf_ip(), $cidr)) continue;
@@ -1179,12 +1306,12 @@ function pwaf_forward(array $cfg): void {
 
 // 判断 IP 是否在 CIDR 或范围内
 // 支持: 192.168.1.0/24  或  192.168.1.1-192.168.2.255  或  单个 IP
-function pwaf_ip_in_range(string $ip, string $range): bool {
+function pwaf_ip_in_range($ip, $range) {
     $ip_long = ip2long($ip);
     if ($ip_long === false) return false;
     // CIDR
     if (strpos($range, '/') !== false) {
-        [$net, $bits] = explode('/', $range, 2);
+        list($net, $bits) = explode('/', $range, 2);
         $bits = (int)$bits;
         if ($bits < 0 || $bits > 32) return false;
         $mask = $bits === 0 ? 0 : (~0 << (32 - $bits));
@@ -1192,7 +1319,7 @@ function pwaf_ip_in_range(string $ip, string $range): bool {
     }
     // Range: x.x.x.x-y.y.y.y
     if (strpos($range, '-') !== false) {
-        [$start, $end] = explode('-', $range, 2);
+        list($start, $end) = explode('-', $range, 2);
         $s = ip2long(trim($start)); $e = ip2long(trim($end));
         if ($s === false || $e === false) return false;
         return $ip_long >= min($s,$e) && $ip_long <= max($s,$e);
@@ -1202,7 +1329,7 @@ function pwaf_ip_in_range(string $ip, string $range): bool {
 }
 
 // ── 自动提交 flag（response hook 内调用）─────────────────────────────────────
-function pwaf_auto_submit_flag(string $flag, array $cfg): void {
+function pwaf_auto_submit_flag($flag, array $cfg) {
     if (empty($cfg['flagsub_enabled']) || empty($cfg['flagsub_template'])) return;
     $tpl = $cfg['flagsub_template'];
     // 解析 HTTP 请求模板
@@ -1237,7 +1364,7 @@ function pwaf_auto_submit_flag(string $flag, array $cfg): void {
     ]]);
     $resp = @file_get_contents($url, false, $ctx);
     // 记录提交结果
-    $lp = $cfg['log'] ?? (dirname(PWAF_SELF) . '/.pwaf_log');
+    $lp = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
     $fl = preg_replace('/\.([^.]+)$/', '_flagsub.$1', $lp);
     @file_put_contents($fl, json_encode([
         'ts'   => time(), 'dt' => date('Y-m-d H:i:s'),
@@ -1247,8 +1374,33 @@ function pwaf_auto_submit_flag(string $flag, array $cfg): void {
 }
 
 
-function pwaf_response_hook(string $out, array $cfg, string $ip): string {
-    $fake = $cfg['fake_flag'] ?? 'flag{fake}';
+function pwaf_response_hook($out, array $cfg, $ip) {
+    // ── Gzip/Deflate 解压 ──────────────────────────────────────────────────
+    // 如果上游 ob_gzhandler 或其他压缩层已压缩输出，正则匹配会失败
+    $was_compressed = false;
+    $compress_encoding = '';
+    if (strlen($out) > 2) {
+        // gzip magic: \x1f\x8b
+        if (substr($out, 0, 2) === "\x1f\x8b") {
+            $decompressed = @gzdecode($out);
+            if ($decompressed !== false) {
+                $was_compressed = true;
+                $compress_encoding = 'gzip';
+                $out = $decompressed;
+            }
+        }
+        // deflate (zlib): \x78\x01 / \x78\x5e / \x78\x9c / \x78\xda
+        elseif ($out[0] === "\x78" && in_array($out[1], array("\x01","\x5e","\x9c","\xda"))) {
+            $decompressed = @gzuncompress($out);
+            if ($decompressed !== false) {
+                $was_compressed = true;
+                $compress_encoding = 'deflate';
+                $out = $decompressed;
+            }
+        }
+    }
+
+    $fake = (isset($cfg['fake_flag']) ? $cfg['fake_flag'] : 'flag{fake}');
     // 支持自定义 flag 正则（用于自动提交），默认通用格式
     $fp = !empty($cfg['flagsub_regex'])
         ? '/' . str_replace('/', '\/', $cfg['flagsub_regex']) . '/'
@@ -1300,25 +1452,39 @@ function pwaf_response_hook(string $out, array $cfg, string $ip): string {
     }
 
     // Shell output detection
-    foreach (['/root:x:0:0:/','uid=\d+\(\w+\)\s+gid=\d+/','/Linux\s+\S+\s+\d+\.\d+\.\d+\s+#\d+/'] as $sp) {
+    foreach (array('/root:x:0:0:/', '/uid=\\d+\\(\\w+\\)\\s+gid=\\d+/', '/Linux\\s+\\S+\\s+\\d+\\.\\d+\\.\\d+\\s+#\\d+/') as $sp) {
         if (@preg_match($sp, $out)) {
             pwaf_log($cfg, $ip, 'shell_output', 'response', substr($out, 0, 200), 'blocked');
-            return '<!DOCTYPE html><html><body><p>OK</p></body></html>';
+            $out = '<!DOCTYPE html><html><body><p>OK</p></body></html>';
+            break;
         }
+    }
+
+    // ── 重压缩 + 修正 Content-Length ────────────────────────────────────────
+    if ($was_compressed) {
+        if ($compress_encoding === 'gzip') {
+            $out = gzencode($out, 6);
+        } elseif ($compress_encoding === 'deflate') {
+            $out = gzcompress($out, 6);
+        }
+    }
+    // 无论是否压缩，都修正 Content-Length（替换 flag 可能改变长度）
+    if (!headers_sent()) {
+        header('Content-Length: ' . strlen($out), true);
     }
     return $out;
 }
 
 // ── L7: File integrity ────────────────────────────────────────────────────────
 // 扫描所有文件（PHP + 配置 + 脚本 + 数据库 + 可执行），检测新增/篡改
-function pwaf_integrity_check(array $cfg): void {
-    $db      = $cfg['integrity_db'] ?? (dirname(PWAF_SELF) . '/.pwaf_int');
-    $webroot = $cfg['webroot'] ?? '';
+function pwaf_integrity_check(array $cfg) {
+    $db      = (isset($cfg['integrity_db']) ? $cfg['integrity_db'] : (pwaf_datadir($cfg) . '/.pwaf_int'));
+    $webroot = (isset($cfg['webroot']) ? $cfg['webroot'] : '');
     if (!$webroot || !is_dir($webroot) || !file_exists($db)) return;
 
     $stored  = json_decode(@file_get_contents($db), true) ?: [];
-    $base    = $stored['b'] ?? [];
-    $lp      = $cfg['log'] ?? (dirname(PWAF_SELF) . '/.pwaf_log');
+    $base    = (isset($stored['b']) ? $stored['b'] : []);
+    $lp      = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
 
     foreach (pwaf_all_files($webroot) as $file) {
         $h = hash_file('sha256', $file);
@@ -1337,7 +1503,7 @@ function pwaf_integrity_check(array $cfg): void {
 }
 
 // 扫描所有需要监控的文件（PHP/配置/脚本/数据库/可执行等）
-function pwaf_all_files(string $wr): array {
+function pwaf_all_files($wr) {
     // 监控扩展名：PHP脚本、配置文件、Shell脚本、数据库、可执行、模板等
     $watch_ext = ['php','php3','php4','php5','php7','phtml','phar',
                   'ini','conf','config','cfg','htaccess','htpasswd',
@@ -1348,6 +1514,12 @@ function pwaf_all_files(string $wr): array {
                   'env','key','pem','crt'];
     $files = [];
     $skip_dirs = ['.git', 'node_modules', 'vendor', '.svn'];
+    // Also skip the data directory (random hidden dir from .pwaf_ptr)
+    $ptr = $wr . '/.pwaf_ptr';
+    if (file_exists($ptr)) {
+        $pdir = trim(file_get_contents($ptr));
+        if ($pdir !== '') $skip_dirs[] = $pdir;
+    }
     try {
         $iter = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator($wr, RecursiveDirectoryIterator::SKIP_DOTS),
@@ -1379,16 +1551,16 @@ function pwaf_all_files(string $wr): array {
 // SECTION 6: ADMIN PANEL
 // =============================================================================
 
-function pwaf_panel(array &$cfg, string $ip): void {
+function pwaf_panel(array &$cfg, $ip) {
     session_start();
-    $key = $_GET['waf_key'] ?? $_POST['waf_key'] ?? '';
-    $self = $_SERVER['PHP_SELF'] . '?waf_key=' . urlencode($key);
+    $key = (isset($GLOBALS['_PWAF_GET']['waf_key']) ? $GLOBALS['_PWAF_GET']['waf_key'] : (isset($GLOBALS['_PWAF_POST']['waf_key']) ? $GLOBALS['_PWAF_POST']['waf_key'] : ''));
+    $self = $GLOBALS['_PWAF_SERVER']['PHP_SELF'] . '?waf_key=' . urlencode($key);
     $e = function($s) { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); };
 
     // Auth
     if (empty($_SESSION['pwaf'])) {
-        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['pw'])) {
-            if (!empty($cfg['hash']) && password_verify($_POST['pw'], $cfg['hash'])) {
+        if ($GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] === 'POST' && isset($GLOBALS['_PWAF_POST']['pw'])) {
+            if (!empty($cfg['hash']) && password_verify($GLOBALS['_PWAF_POST']['pw'], $cfg['hash'])) {
                 $_SESSION['pwaf'] = $ip;
             } else {
                 usleep(2000000);
@@ -1400,26 +1572,26 @@ function pwaf_panel(array &$cfg, string $ip): void {
     if ($_SESSION['pwaf'] !== $ip) { session_destroy(); pwaf_login_page($e, $key, 'Session expired.'); return; }
 
     // ── AJAX 轮询接口（浏览器通知用）────────────────────────────────────────
-    if (isset($_GET['_poll'])) {
+    if (isset($GLOBALS['_PWAF_GET']['_poll'])) {
         header('Content-Type: application/json');
         $poll_stats = pwaf_stats($cfg);
-        $latest = $poll_stats['recent'][0] ?? [];
+        $latest = (isset($poll_stats['recent'][0]) ? $poll_stats['recent'][0] : []);
         echo json_encode([
             'total'       => $poll_stats['total'],
             'blocked'     => $poll_stats['blocked'],
-            'latest_rule' => $latest['rule'] ?? '',
-            'latest_ip'   => $latest['ip'] ?? '',
-            'latest_uri'  => $latest['uri'] ?? '',
+            'latest_rule' => (isset($latest['rule']) ? $latest['rule'] : ''),
+            'latest_ip'   => (isset($latest['ip']) ? $latest['ip'] : ''),
+            'latest_uri'  => (isset($latest['uri']) ? $latest['uri'] : ''),
         ]);
         return;
     }
 
     // ── 流量重放代理接口 ────────────────────────────────────────────────────
-    if (isset($_GET['_replay']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($GLOBALS['_PWAF_GET']['_replay']) && $GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] === 'POST') {
         header('Content-Type: application/json');
-        $target_ip   = trim($_POST['target_ip'] ?? '');
-        $target_port = (int)($_POST['target_port'] ?? 80);
-        $raw_request = $_POST['raw_request'] ?? '';
+        $target_ip   = trim((isset($GLOBALS['_PWAF_POST']['target_ip']) ? $GLOBALS['_PWAF_POST']['target_ip'] : ''));
+        $target_port = (int)((isset($GLOBALS['_PWAF_POST']['target_port']) ? $GLOBALS['_PWAF_POST']['target_port'] : 80));
+        $raw_request = (isset($GLOBALS['_PWAF_POST']['raw_request']) ? $GLOBALS['_PWAF_POST']['raw_request'] : '');
         if (!$target_ip || !$raw_request) {
             echo json_encode(['error' => 'missing params']); return;
         }
@@ -1472,37 +1644,37 @@ function pwaf_panel(array &$cfg, string $ip): void {
     }
 
     // Actions
-    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-        $act = $_POST['act'] ?? '';
+    if ($GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] === 'POST') {
+        $act = (isset($GLOBALS['_PWAF_POST']['act']) ? $GLOBALS['_PWAF_POST']['act'] : '');
         switch ($act) {
             case 'toggle_waf':   $cfg['enabled'] = !$cfg['enabled']; pwaf_save_cfg($cfg); break;
             case 'toggle_autoban': $cfg['auto_ban'] = empty($cfg['auto_ban']); pwaf_save_cfg($cfg); break;
             case 'toggle_stealth': $cfg['stealth']  = empty($cfg['stealth']);  pwaf_save_cfg($cfg); break;
             case 'save_openbasedir':
-                $cfg['open_basedir'] = trim($_POST['open_basedir'] ?? '');
+                $cfg['open_basedir'] = trim((isset($GLOBALS['_PWAF_POST']['open_basedir']) ? $GLOBALS['_PWAF_POST']['open_basedir'] : ''));
                 pwaf_save_cfg($cfg);
                 if ($cfg['open_basedir']) {
                     @ini_set('open_basedir', $cfg['open_basedir'] . PATH_SEPARATOR . '/tmp/' . PATH_SEPARATOR . sys_get_temp_dir());
                 }
                 break;
             case 'toggle_rule':
-                $r = $_POST['rule'] ?? '';
+                $r = (isset($GLOBALS['_PWAF_POST']['rule']) ? $GLOBALS['_PWAF_POST']['rule'] : '');
                 if (isset($cfg['rules'][$r])) { $cfg['rules'][$r] = !$cfg['rules'][$r]; pwaf_save_cfg($cfg); }
                 break;
             case 'add_wl':
-                $ni = trim($_POST['ip'] ?? '');
+                $ni = trim((isset($GLOBALS['_PWAF_POST']['ip']) ? $GLOBALS['_PWAF_POST']['ip'] : ''));
                 if (filter_var($ni, FILTER_VALIDATE_IP) && !in_array($ni, $cfg['whitelist'], true)) {
                     $cfg['whitelist'][] = $ni; pwaf_save_cfg($cfg);
                 }
                 break;
             case 'add_bl':
-                $ni = trim($_POST['ip'] ?? '');
+                $ni = trim((isset($GLOBALS['_PWAF_POST']['ip']) ? $GLOBALS['_PWAF_POST']['ip'] : ''));
                 if (filter_var($ni, FILTER_VALIDATE_IP) && !in_array($ni, $cfg['blacklist'], true)) {
                     $cfg['blacklist'][] = $ni; pwaf_save_cfg($cfg);
                 }
                 break;
             case 'rm_ip':
-                $ri = trim($_POST['ip'] ?? ''); $lst = $_POST['list'] ?? '';
+                $ri = trim((isset($GLOBALS['_PWAF_POST']['ip']) ? $GLOBALS['_PWAF_POST']['ip'] : '')); $lst = (isset($GLOBALS['_PWAF_POST']['list']) ? $GLOBALS['_PWAF_POST']['list'] : '');
                 if ($lst === 'wl') {
                     $x = $ri; $cfg['whitelist'] = array_values(array_filter($cfg['whitelist'], function($v) use ($x) { return $v !== $x; }));
                 } elseif ($lst === 'bl') {
@@ -1513,7 +1685,7 @@ function pwaf_panel(array &$cfg, string $ip): void {
                 pwaf_save_cfg($cfg);
                 break;
             case 'fake_flag':
-                $ff = trim($_POST['ff'] ?? '');
+                $ff = trim((isset($GLOBALS['_PWAF_POST']['ff']) ? $GLOBALS['_PWAF_POST']['ff'] : ''));
                 if ($ff) { $cfg['fake_flag'] = $ff; pwaf_save_cfg($cfg); }
                 break;
             case 'clear_log': @file_put_contents($cfg['log'], ''); break;
@@ -1522,9 +1694,9 @@ function pwaf_panel(array &$cfg, string $ip): void {
             case 'logout': session_destroy(); header('Location: '.$self); exit;
             // ── 自定义规则 ──────────────────────────────────────────────────────
             case 'add_custom_rule':
-                $rname = preg_replace('/[^a-z0-9_]/', '', strtolower(trim($_POST['rname'] ?? '')));
-                $rpat  = trim($_POST['rpat'] ?? '');
-                $rscope= trim($_POST['rscope'] ?? 'all');
+                $rname = preg_replace('/[^a-z0-9_]/', '', strtolower(trim((isset($GLOBALS['_PWAF_POST']['rname']) ? $GLOBALS['_PWAF_POST']['rname'] : ''))));
+                $rpat  = trim((isset($GLOBALS['_PWAF_POST']['rpat']) ? $GLOBALS['_PWAF_POST']['rpat'] : ''));
+                $rscope= trim((isset($GLOBALS['_PWAF_POST']['rscope']) ? $GLOBALS['_PWAF_POST']['rscope'] : 'all'));
                 if ($rname && $rpat && @preg_match($rpat, '') !== false) {
                     if (!isset($cfg['custom_rules'])) $cfg['custom_rules'] = [];
                     $cfg['custom_rules'][$rname] = ['pat' => $rpat, 'scope' => $rscope, 'enabled' => true];
@@ -1532,13 +1704,13 @@ function pwaf_panel(array &$cfg, string $ip): void {
                 }
                 break;
             case 'del_custom_rule':
-                $rname = trim($_POST['rname'] ?? '');
+                $rname = trim((isset($GLOBALS['_PWAF_POST']['rname']) ? $GLOBALS['_PWAF_POST']['rname'] : ''));
                 if (isset($cfg['custom_rules'][$rname])) {
                     unset($cfg['custom_rules'][$rname]); pwaf_save_cfg($cfg);
                 }
                 break;
             case 'toggle_custom_rule':
-                $rname = trim($_POST['rname'] ?? '');
+                $rname = trim((isset($GLOBALS['_PWAF_POST']['rname']) ? $GLOBALS['_PWAF_POST']['rname'] : ''));
                 if (isset($cfg['custom_rules'][$rname])) {
                     $cfg['custom_rules'][$rname]['enabled'] = !$cfg['custom_rules'][$rname]['enabled'];
                     pwaf_save_cfg($cfg);
@@ -1546,9 +1718,9 @@ function pwaf_panel(array &$cfg, string $ip): void {
                 break;
             // ── 流量转发 ────────────────────────────────────────────────────────
             case 'save_forward':
-                $cfg['forward_enabled'] = !empty($_POST['forward_enabled']);
+                $cfg['forward_enabled'] = !empty($GLOBALS['_PWAF_POST']['forward_enabled']);
                 // 解析转发目标列表（每行一个，格式: host:port [cidr]）
-                $raw_targets = trim($_POST['forward_targets_raw'] ?? '');
+                $raw_targets = trim((isset($GLOBALS['_PWAF_POST']['forward_targets_raw']) ? $GLOBALS['_PWAF_POST']['forward_targets_raw'] : ''));
                 $targets = [];
                 foreach (explode("\n", $raw_targets) as $line) {
                     $line = trim($line);
@@ -1556,9 +1728,9 @@ function pwaf_panel(array &$cfg, string $ip): void {
                     // 格式: host[:port] [cidr_or_range]
                     $parts = preg_split('/\s+/', $line, 3);
                     $hp = $parts[0]; // host or host:port
-                    $cidr = $parts[1] ?? '';
+                    $cidr = (isset($parts[1]) ? $parts[1] : '');
                     if (strpos($hp, ':') !== false) {
-                        [$h, $p] = explode(':', $hp, 2);
+                        list($h, $p) = explode(':', $hp, 2);
                     } else { $h = $hp; $p = '80'; }
                     if (!$h) continue;
                     $targets[] = ['host'=>$h, 'port'=>(int)$p, 'cidr'=>$cidr, 'enabled'=>true];
@@ -1568,15 +1740,15 @@ function pwaf_panel(array &$cfg, string $ip): void {
                 break;
             // ── 自动提交 flag ───────────────────────────────────────────────────
             case 'save_flagsub':
-                $cfg['flagsub_enabled']  = !empty($_POST['flagsub_enabled']);
-                $cfg['flagsub_regex']    = trim($_POST['flagsub_regex'] ?? '');
-                $cfg['flagsub_template'] = trim($_POST['flagsub_template'] ?? '');
+                $cfg['flagsub_enabled']  = !empty($GLOBALS['_PWAF_POST']['flagsub_enabled']);
+                $cfg['flagsub_regex']    = trim((isset($GLOBALS['_PWAF_POST']['flagsub_regex']) ? $GLOBALS['_PWAF_POST']['flagsub_regex'] : ''));
+                $cfg['flagsub_template'] = trim((isset($GLOBALS['_PWAF_POST']['flagsub_template']) ? $GLOBALS['_PWAF_POST']['flagsub_template'] : ''));
                 pwaf_save_cfg($cfg);
                 break;
             // ── 紧急清理 ──────────────────────────────────────────────────────
             case 'kill_processes':
                 $kill_log = [];
-                if (PHP_OS_FAMILY !== 'Windows') {
+                if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
                     // 清空所有 crontab
                     @exec('crontab -r 2>/dev/null', $o); $kill_log[] = 'crontab cleared';
                     @exec('for f in /var/spool/cron/*; do echo > "$f" 2>/dev/null; done');
@@ -1591,8 +1763,8 @@ function pwaf_panel(array &$cfg, string $ip): void {
                             $proc = trim($proc);
                             if (!$proc) continue;
                             $parts = preg_split('/\s+/', $proc, 2);
-                            $pid = (int)($parts[0] ?? 0);
-                            $cmd = strtolower($parts[1] ?? '');
+                            $pid = (int)((isset($parts[0]) ? $parts[0] : 0));
+                            $cmd = strtolower((isset($parts[1]) ? $parts[1] : ''));
                             if ($pid <= 1) continue;
                             $isSafe = false;
                             foreach ($safe as $s) { if (strpos($cmd, $s) !== false) { $isSafe = true; break; } }
@@ -1781,7 +1953,7 @@ textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.
 <form method="post" action="<?= $e($self) ?>"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="export_csv"><button type="submit" class="btn bs">导出 CSV</button></form>
 <form method="post" action="<?= $e($self) ?>" onsubmit="return confirm('确认清空日志？')"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="clear_log"><button type="submit" class="btn br">清空日志</button></form>
 <form method="post" action="<?= $e($self) ?>" onsubmit="return confirm('紧急清理：杀掉可疑进程、清空 crontab、清理 /tmp 脚本？\n此操作不可撤销！')"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="kill_processes"><button type="submit" class="btn br" title="杀掉反弹shell/挖矿进程、清空crontab、清理/tmp脚本">&#x1F4A3; 紧急清理</button></form>
-<form method="post" action="<?= $e($self) ?>" style="display:flex;gap:6px;align-items:center"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="save_openbasedir"><input type="text" name="open_basedir" value="<?= $e($cfg['open_basedir'] ?? '') ?>" style="width:220px" placeholder="open_basedir 路径（空=不限制）" title="限制 PHP 文件操作范围，如 /var/www/html"><button type="submit" class="btn bs">设置 basedir</button></form>
+<form method="post" action="<?= $e($self) ?>" style="display:flex;gap:6px;align-items:center"><input type="hidden" name="waf_key" value="<?= $e($key) ?>"><input type="hidden" name="act" value="save_openbasedir"><input type="text" name="open_basedir" value="<?= $e(isset($cfg['open_basedir']) ? $cfg['open_basedir'] : '') ?>" style="width:220px" placeholder="open_basedir 路径（空=不限制）" title="限制 PHP 文件操作范围，如 /var/www/html"><button type="submit" class="btn bs">设置 basedir</button></form>
 </div></div>
 
 <div class="sec"><div class="sec-title">Top 攻击者</div>
@@ -1850,7 +2022,7 @@ $rule_info = [
 ];
 ?>
 <div class="sec"><div class="sec-title">内置检测规则</div>
-<?php foreach ($cfg['rules'] as $r => $en): $info = $rule_info[$r] ?? [$r, '', '']; ?>
+<?php foreach ($cfg['rules'] as $r => $en): $info = (isset($rule_info[$r]) ? $rule_info[$r] : [$r, '', '']); ?>
 <div class="rule-row">
   <div class="rule-header">
     <div class="rule-info">
@@ -1883,7 +2055,7 @@ $rule_info = [
   <div style="display:flex;align-items:center;gap:8px;flex:1">
     <span class="b" style="background:#1e3a5f"><?= $e($rname) ?></span>
     <code style="color:#7dd3fc;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= $e($rcfg['pat']) ?></code>
-    <span style="color:var(--text2);font-size:10px">范围: <?= $e($rcfg['scope'] ?? 'all') ?></span>
+    <span style="color:var(--text2);font-size:10px">范围: <?= $e((isset($rcfg['scope']) ? $rcfg['scope'] : 'all')) ?></span>
   </div>
   <div style="display:flex;gap:6px;align-items:center">
     <form method="post" action="<?= $e($self) ?>" style="display:inline">
@@ -1975,15 +2147,15 @@ $rule_info = [
 <tr><th>时间</th><th>IP</th><th>规则</th><th>方法</th><th>URI</th><th>参数</th><th>Payload</th><th>Referer</th><th>POST</th><th>耗时(ms)</th></tr>
 <?php foreach ($stats['recent'] as $ev): ?>
 <tr>
-<td style="white-space:nowrap"><?= date('m-d H:i:s', $ev['ts']??0) ?></td>
-<td><?= $e($ev['ip']??'') ?></td>
-<td><span class="b b-<?= $e($ev['rule']??'') ?>"><?= $e($ev['rule']??'') ?></span></td>
-<td><?= $e($ev['method']??'') ?></td>
-<td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e($ev['uri']??'') ?>"><?= $e($ev['uri']??'') ?></td>
-<td><?= $e($ev['param']??'') ?></td>
-<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="<?= $e($ev['payload']??'') ?>"><?= $e($ev['payload']??'') ?></td>
-<td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)" title="<?= $e($ev['referer']??'') ?>"><?= $e($ev['referer']??'-') ?></td>
-<td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#7dd3fc" title="<?= $e($ev['post']??'') ?>"><?= $e($ev['post']??'-') ?></td>
+<td style="white-space:nowrap"><?= date('m-d H:i:s', (isset($ev['ts']) ? $ev['ts'] : 0)) ?></td>
+<td><?= $e((isset($ev['ip']) ? $ev['ip'] : '')) ?></td>
+<td><span class="b b-<?= $e(isset($ev['rule']) ? $ev['rule'] : '') ?>"><?= $e((isset($ev['rule']) ? $ev['rule'] : '')) ?></span></td>
+<td><?= $e((isset($ev['method']) ? $ev['method'] : '')) ?></td>
+<td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e(isset($ev['uri']) ? $ev['uri'] : '') ?>"><?= $e((isset($ev['uri']) ? $ev['uri'] : '')) ?></td>
+<td><?= $e((isset($ev['param']) ? $ev['param'] : '')) ?></td>
+<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e((isset($ev['payload']) ? $ev['payload'] : '')) ?></td>
+<td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)" title="<?= $e(isset($ev['referer']) ? $ev['referer'] : '') ?>"><?= $e((isset($ev['referer']) ? $ev['referer'] : '-')) ?></td>
+<td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#7dd3fc" title="<?= $e(isset($ev['post']) ? $ev['post'] : '') ?>"><?= $e((isset($ev['post']) ? $ev['post'] : '-')) ?></td>
 <td style="color:var(--text2)"><?= isset($ev['ms']) ? $ev['ms'] : '-' ?></td>
 </tr><?php endforeach; ?>
 </table></div></div>
@@ -2011,8 +2183,8 @@ $rule_info = [
     <div style="color:var(--text2);font-size:11px;margin-bottom:6px">转发目标列表（每行一个）</div>
     <?php
     $fwd_raw = '';
-    foreach ($cfg['forward_targets'] ?? [] as $t) {
-        $line = ($t['host'] ?? '') . ':' . ($t['port'] ?? 80);
+    foreach ((isset($cfg['forward_targets']) ? $cfg['forward_targets'] : array()) as $t) {
+        $line = (isset($t['host']) ? $t['host'] : '') . ':' . (isset($t['port']) ? $t['port'] : 80);
         if (!empty($t['cidr'])) $line .= ' ' . $t['cidr'];
         $fwd_raw .= $line . "\n";
     }
@@ -2035,18 +2207,18 @@ $rule_info = [
 <!-- INTEGRITY TAB -->
 <div id="tab-integrity" class="tab-panel">
 <?php
-$int_db = $cfg['integrity_db'] ?? (dirname(PWAF_SELF) . '/.pwaf_int');
+$int_db = (isset($cfg['integrity_db']) ? $cfg['integrity_db'] : (pwaf_datadir($cfg) . '/.pwaf_int'));
 $int_stored = file_exists($int_db) ? (json_decode(@file_get_contents($int_db), true) ?: []) : [];
-$int_base = $int_stored['b'] ?? [];
-$int_ts   = $int_stored['ts'] ?? 0;
+$int_base = (isset($int_stored['b']) ? $int_stored['b'] : []);
+$int_ts   = (isset($int_stored['ts']) ? $int_stored['ts'] : 0);
 // 从日志中提取完整性告警
 $int_events = [];
-$lp_int = $cfg['log'] ?? '';
+$lp_int = (isset($cfg['log']) ? $cfg['log'] : '');
 if (file_exists($lp_int)) {
     foreach (array_slice((array)@file($lp_int, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES), -5000) as $line) {
         $ev = json_decode($line, true);
         if (!is_array($ev)) continue;
-        if (strpos($ev['rule'] ?? '', 'integrity_') === 0 || strpos($ev['rule'] ?? '', 'watcher_') === 0) {
+        if (strpos((isset($ev['rule']) ? $ev['rule'] : ''), 'integrity_') === 0 || strpos((isset($ev['rule']) ? $ev['rule'] : ''), 'watcher_') === 0) {
             $int_events[] = $ev;
         }
     }
@@ -2087,18 +2259,18 @@ $int_events = array_reverse(array_slice($int_events, -200));
 <div style="overflow-x:auto"><table>
 <tr><th>时间</th><th>类型</th><th>文件路径</th><th>SHA256</th></tr>
 <?php foreach ($int_events as $ev):
-    $rule = $ev['rule'] ?? '';
+    $rule = (isset($ev['rule']) ? $ev['rule'] : '');
     $color = $rule === 'integrity_new' ? '#f97316' : (strpos($rule, 'watcher_') === 0 ? '#f87171' : '#fbbf24');
     $labels = ['integrity_new'=>'新增文件','integrity_modified'=>'文件篡改',
                'watcher_shell'=>'不死马查杀','watcher_restore'=>'文件恢复',
                'watcher_tamper'=>'篡改恢复','watcher_deleted'=>'文件删除'];
-    $label = $labels[$rule] ?? $rule;
+    $label = (isset($labels[$rule]) ? $labels[$rule] : $rule);
 ?>
 <tr>
-  <td style="white-space:nowrap"><?= $e($ev['dt'] ?? date('Y-m-d H:i:s', $ev['ts']??0)) ?></td>
+  <td style="white-space:nowrap"><?= $e((isset($ev['dt']) ? $ev['dt'] : date('Y-m-d H:i:s', (isset($ev['ts']) ? $ev['ts'] : 0)))) ?></td>
   <td><span class="b" style="background:<?= $color ?>;color:#000"><?= $e($label) ?></span></td>
-  <td style="color:#7dd3fc;word-break:break-all;max-width:400px"><?= $e($ev['uri'] ?? '') ?></td>
-  <td style="color:var(--text2);font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e($ev['payload']??'') ?>"><?= $e(substr($ev['payload']??'',0,16)) ?>...</td>
+  <td style="color:#7dd3fc;word-break:break-all;max-width:400px"><?= $e((isset($ev['uri']) ? $ev['uri'] : '')) ?></td>
+  <td style="color:var(--text2);font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e(substr((isset($ev['payload']) ? $ev['payload'] : ''),0,16)) ?>...</td>
 </tr>
 <?php endforeach; ?>
 </table></div></div>
@@ -2133,12 +2305,12 @@ $int_events = array_reverse(array_slice($int_events, -200));
 
   <div style="margin-bottom:14px">
     <div style="color:var(--text2);font-size:11px;margin-bottom:6px">Flag 正则（留空使用默认 <code style="color:#7dd3fc">flag\{...\}</code>）</div>
-    <input type="text" name="flagsub_regex" value="<?= $e($cfg['flagsub_regex'] ?? '') ?>" placeholder="flag\{[A-Za-z0-9_\-]{1,100}\}" style="width:100%;max-width:480px">
+    <input type="text" name="flagsub_regex" value="<?= $e(isset($cfg['flagsub_regex']) ? $cfg['flagsub_regex'] : '') ?>" placeholder="flag\{[A-Za-z0-9_\-]{1,100}\}" style="width:100%;max-width:480px">
   </div>
 
   <div style="margin-bottom:14px">
     <div style="color:var(--text2);font-size:11px;margin-bottom:6px">HTTP 请求模板（从 Burp/Yakit 复制原始数据包，flag 处填 <code style="color:#f97316">${flag}</code>）</div>
-    <textarea name="flagsub_template" rows="14" placeholder="POST /submit HTTP/1.1&#10;Host: ctf-platform.example.com&#10;Content-Type: application/x-www-form-urlencoded&#10;Cookie: session=your_session_here&#10;&#10;token=your_token&flag=${flag}"><?= $e($cfg['flagsub_template'] ?? '') ?></textarea>
+    <textarea name="flagsub_template" rows="14" placeholder="POST /submit HTTP/1.1&#10;Host: ctf-platform.example.com&#10;Content-Type: application/x-www-form-urlencoded&#10;Cookie: session=your_session_here&#10;&#10;token=your_token&flag=${flag}"><?= $e((isset($cfg['flagsub_template']) ? $cfg['flagsub_template'] : '')) ?></textarea>
     <div style="color:var(--text2);font-size:10px;margin-top:4px">格式：第一行 METHOD /path HTTP/1.1，然后请求头，空行后是请求体。Host 头必须填写。</div>
   </div>
 
@@ -2156,7 +2328,7 @@ $int_events = array_reverse(array_slice($int_events, -200));
 
 <?php
 // 显示最近的提交记录
-$fl = preg_replace('/\.([^.]+)$/', '_flagsub.$1', $cfg['log'] ?? (dirname(PWAF_SELF) . '/.pwaf_log'));
+$fl = preg_replace('/\.([^.]+)$/', '_flagsub.$1', (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log')));
 if (file_exists($fl)):
     $lines = array_filter(array_slice(file($fl), -20));
 ?>
@@ -2165,10 +2337,10 @@ if (file_exists($fl)):
 <?php foreach (array_reverse(array_values($lines)) as $line):
     $ev = json_decode($line, true); if (!$ev) continue; ?>
 <tr>
-  <td style="white-space:nowrap"><?= $e($ev['dt'] ?? '') ?></td>
-  <td style="color:#f97316"><?= $e($ev['flag'] ?? '') ?></td>
-  <td style="color:var(--text2)"><?= $e($ev['url'] ?? '') ?></td>
-  <td style="color:var(--green);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= $e($ev['resp'] ?? '') ?></td>
+  <td style="white-space:nowrap"><?= $e((isset($ev['dt']) ? $ev['dt'] : '')) ?></td>
+  <td style="color:#f97316"><?= $e((isset($ev['flag']) ? $ev['flag'] : '')) ?></td>
+  <td style="color:var(--text2)"><?= $e((isset($ev['url']) ? $ev['url'] : '')) ?></td>
+  <td style="color:var(--green);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= $e((isset($ev['resp']) ? $ev['resp'] : '')) ?></td>
 </tr>
 <?php endforeach; ?>
 </table></div>
@@ -2236,21 +2408,21 @@ if (file_exists($fl)):
 <table id="replay-log-table">
 <tr><th>时间</th><th>规则</th><th>方法</th><th>URI</th><th>Payload</th><th>操作</th></tr>
 <?php foreach (array_slice($stats['recent'], 0, 30) as $ev):
-    if (($ev['action']??'') !== 'block') continue;
-    $rmethod = $ev['method'] ?? 'GET';
-    $ruri = $ev['uri'] ?? '/';
-    $rpost = $ev['post'] ?? '';
-    $replay_raw = $rmethod . ' ' . $ruri . " HTTP/1.1\nHost: {target}\nUser-Agent: " . ($ev['ua'] ?? 'Mozilla/5.0');
+    if (((isset($ev['action']) ? $ev['action'] : '')) !== 'block') continue;
+    $rmethod = (isset($ev['method']) ? $ev['method'] : 'GET');
+    $ruri = (isset($ev['uri']) ? $ev['uri'] : '/');
+    $rpost = (isset($ev['post']) ? $ev['post'] : '');
+    $replay_raw = $rmethod . ' ' . $ruri . " HTTP/1.1\nHost: {target}\nUser-Agent: " . ((isset($ev['ua']) ? $ev['ua'] : 'Mozilla/5.0'));
     if ($rmethod === 'POST' && $rpost) {
         $replay_raw .= "\nContent-Type: application/x-www-form-urlencoded\n\n" . $rpost;
     }
 ?>
 <tr>
-  <td style="white-space:nowrap"><?= date('H:i:s', $ev['ts']??0) ?></td>
-  <td><span class="b b-<?= $e($ev['rule']??'') ?>"><?= $e($ev['rule']??'') ?></span></td>
+  <td style="white-space:nowrap"><?= date('H:i:s', (isset($ev['ts']) ? $ev['ts'] : 0)) ?></td>
+  <td><span class="b b-<?= $e(isset($ev['rule']) ? $ev['rule'] : '') ?>"><?= $e((isset($ev['rule']) ? $ev['rule'] : '')) ?></span></td>
   <td><?= $e($rmethod) ?></td>
   <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e($ruri) ?>"><?= $e($ruri) ?></td>
-  <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="<?= $e($ev['payload']??'') ?>"><?= $e(substr($ev['payload']??'',0,40)) ?></td>
+  <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e(substr((isset($ev['payload']) ? $ev['payload'] : ''),0,40)) ?></td>
   <td><button type="button" class="btn bs" style="padding:2px 6px;font-size:10px" onclick="pwafLoadReplay(this)" data-raw="<?= $e(base64_encode($replay_raw)) ?>">加载</button></td>
 </tr>
 <?php endforeach; ?>
@@ -2434,7 +2606,7 @@ async function pwafReplayBroadcast() {
 <?php
 }
 
-function pwaf_login_page(callable $e, string $key, string $err): void { ?>
+function pwaf_login_page(callable $e, $key, $err) { ?>
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PhoenixWAF</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -2471,8 +2643,8 @@ button[type=submit]:active{transform:translateY(0)}
 <?php
 }
 
-function pwaf_stats(array $cfg): array {
-    $lp = $cfg['log'] ?? '';
+function pwaf_stats(array $cfg) {
+    $lp = (isset($cfg['log']) ? $cfg['log'] : '');
     $s  = ['total'=>0,'blocked'=>0,'by_rule'=>[],'by_ip'=>[],'recent'=>[],'int_alerts'=>0];
     if (!file_exists($lp)) return $s;
 
@@ -2516,10 +2688,10 @@ function pwaf_stats(array $cfg): array {
         $ev = json_decode($line, true);
         if (!is_array($ev)) continue;
         $s['total']++;
-        if (($ev['action']??'') === 'block') $s['blocked']++;
-        $r = $ev['rule'] ?? 'unknown'; $i = $ev['ip'] ?? 'unknown';
-        $s['by_rule'][$r] = ($s['by_rule'][$r]??0) + 1;
-        if ($i !== 'SYS') $s['by_ip'][$i] = ($s['by_ip'][$i]??0) + 1;
+        if (((isset($ev['action']) ? $ev['action'] : '')) === 'block') $s['blocked']++;
+        $r = (isset($ev['rule']) ? $ev['rule'] : 'unknown'); $i = (isset($ev['ip']) ? $ev['ip'] : 'unknown');
+        $s['by_rule'][$r] = ((isset($s['by_rule'][$r]) ? $s['by_rule'][$r] : 0)) + 1;
+        if ($i !== 'SYS') $s['by_ip'][$i] = ((isset($s['by_ip'][$i]) ? $s['by_ip'][$i] : 0)) + 1;
         if (strpos($r, 'integrity_') === 0) $s['int_alerts']++;
     }
     arsort($s['by_rule']); arsort($s['by_ip']);
@@ -2533,26 +2705,26 @@ function pwaf_stats(array $cfg): array {
     return $s;
 }
 
-function pwaf_export_csv(array $cfg): void {
+function pwaf_export_csv(array $cfg) {
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="pwaf_' . date('Ymd_His') . '.csv"');
     $out = fopen('php://output', 'w');
     fputcsv($out, ['ts','datetime','ip','method','uri','rule','payload','param','ua','action']);
-    $lp = $cfg['log'] ?? '';
+    $lp = (isset($cfg['log']) ? $cfg['log'] : '');
     if (file_exists($lp)) {
         foreach ((array)@file($lp, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES) as $line) {
             $ev = json_decode($line, true);
-            if (is_array($ev)) fputcsv($out, [$ev['ts']??'',date('Y-m-d H:i:s',$ev['ts']??0),
-                $ev['ip']??'',$ev['method']??'',$ev['uri']??'',$ev['rule']??'',$ev['payload']??'',
-                $ev['param']??'',$ev['ua']??'',$ev['action']??'']);
+            if (is_array($ev)) fputcsv($out, [(isset($ev['ts']) ? $ev['ts'] : ''),date('Y-m-d H:i:s',(isset($ev['ts']) ? $ev['ts'] : 0)),
+                (isset($ev['ip']) ? $ev['ip'] : ''),(isset($ev['method']) ? $ev['method'] : ''),(isset($ev['uri']) ? $ev['uri'] : ''),(isset($ev['rule']) ? $ev['rule'] : ''),(isset($ev['payload']) ? $ev['payload'] : ''),
+                (isset($ev['param']) ? $ev['param'] : ''),(isset($ev['ua']) ? $ev['ua'] : ''),(isset($ev['action']) ? $ev['action'] : '')]);
         }
     }
     fclose($out);
 }
 
-function pwaf_update_baseline(array $cfg): void {
-    $db = $cfg['integrity_db'] ?? (dirname(PWAF_SELF) . '/.pwaf_int');
-    $wr = $cfg['webroot'] ?? '';
+function pwaf_update_baseline(array $cfg) {
+    $db = (isset($cfg['integrity_db']) ? $cfg['integrity_db'] : (pwaf_datadir($cfg) . '/.pwaf_int'));
+    $wr = (isset($cfg['webroot']) ? $cfg['webroot'] : '');
     if (!$wr || !is_dir($wr)) return;
     $h = [];
     foreach (pwaf_all_files($wr) as $f) $h[$f] = hash_file('sha256', $f);
@@ -2563,8 +2735,8 @@ function pwaf_update_baseline(array $cfg): void {
 // SECTION 7: CLI INSTALLER
 // =============================================================================
 
-function pwaf_cli(array $argv): void {
-    $cmd = $argv[1] ?? '';
+function pwaf_cli(array $argv) {
+    $cmd = (isset($argv[1]) ? $argv[1] : '');
     if (!$cmd || $cmd === '--help') {
         echo "PhoenixWAF v" . PWAF_VER . "\n";
         echo "  --install   <webroot> [--password P] [--key K]\n";
@@ -2575,7 +2747,7 @@ function pwaf_cli(array $argv): void {
         echo "  --ldpreload <webroot>   (deploy precompiled waf.so for LD_PRELOAD protection)\n";
         return;
     }
-    $wr = $argv[2] ?? getcwd();
+    $wr = (isset($argv[2]) ? $argv[2] : getcwd());
     if ($cmd === '--install')       pwaf_install($argv);
     elseif ($cmd === '--uninstall') pwaf_uninstall($wr);
     elseif ($cmd === '--status')    pwaf_status($wr);
@@ -2585,7 +2757,7 @@ function pwaf_cli(array $argv): void {
     else echo "[!] Unknown: $cmd\n";
 }
 
-function pwaf_install(array $argv): void {
+function pwaf_install(array $argv) {
     $wr = null; $pw = null; $key = null;
     for ($i = 2; $i < count($argv); $i++) {
         if ($argv[$i] === '--password' && isset($argv[$i+1])) { $pw  = $argv[++$i]; }
@@ -2601,6 +2773,15 @@ function pwaf_install(array $argv): void {
 
     echo "\n  PhoenixWAF v" . PWAF_VER . " — Installing to $wr\n\n";
 
+    // Create data directory — random hidden dir inside webroot
+    $rand_name = '.' . substr(md5(uniqid('pwaf', true) . random_int(0, 999999)), 0, 8);
+    $datadir = $wr . '/' . $rand_name;
+    @mkdir($datadir, 0700, true);
+    // Write pointer file so waf.php can find the data dir
+    file_put_contents($wr . '/.pwaf_ptr', $rand_name, LOCK_EX);
+    echo "[+] Data directory: $datadir\n";
+    echo "[+] Pointer file: $wr/.pwaf_ptr -> $rand_name\n";
+
     // Copy WAF file
     $dst = $wr . '/waf.php';
     if (realpath(PWAF_SELF) !== realpath($dst)) {
@@ -2608,21 +2789,22 @@ function pwaf_install(array $argv): void {
         echo "[+] waf.php → $dst\n";
     } else { echo "[+] waf.php already in place\n"; }
 
-    // Build config
+    // Build config — all data files in $datadir (outside webroot)
     $cfg = pwaf_default_cfg();
-    $cfg['hash']         = password_hash($pw, PASSWORD_BCRYPT, ['cost'=>10]);
+    $cfg['hash']         = password_hash($pw, PASSWORD_BCRYPT, array('cost' => 10));
     $cfg['key']          = $key;
-    $cfg['log']          = $wr . '/.pwaf_log';
-    $cfg['rate_db']      = $wr . '/.pwaf_rate';
-    $cfg['integrity_db'] = $wr . '/.pwaf_int';
-    $cfg['backup']       = $wr . '/.pwaf_bak.php';
+    $cfg['datadir']      = $datadir;
+    $cfg['log']          = $datadir . '/.pwaf_log';
+    $cfg['rate_db']      = $datadir . '/.pwaf_rate';
+    $cfg['integrity_db'] = $datadir . '/.pwaf_int';
+    $cfg['backup']       = $datadir . '/.pwaf_bak.php';
     $cfg['webroot']      = $wr;
     $cfg['enabled']      = true;
 
-    file_put_contents($wr . '/.pwaf.php', '<?php return ' . var_export($cfg, true) . ';', LOCK_EX);
-    echo "[+] Config saved\n";
+    file_put_contents($datadir . '/.pwaf.php', '<?php return ' . var_export($cfg, true) . ';', LOCK_EX);
+    echo "[+] Config saved: $datadir/.pwaf.php\n";
     copy($dst, $cfg['backup']);
-    echo "[+] Backup saved\n";
+    echo "[+] Backup saved: $datadir/.pwaf_bak.php\n";
     if (!file_exists($cfg['log'])) { touch($cfg['log']); echo "[+] Log created\n"; }
 
     // Scan PHP files
@@ -2676,12 +2858,17 @@ function pwaf_install(array $argv): void {
     }
     echo "[+] C: Physical prepend — $inj injected, $skip skipped\n";
 
-    // Protect WAF files via .htaccess
+    // Protect WAF files via .htaccess (ptr file + random dir + waf.php)
     if (file_exists($ht)) {
         $h = file_get_contents($ht);
-        if (strpos($h, 'FilesMatch') === false) {
-            file_put_contents($ht, $h . "\n<FilesMatch \"^(\\.pwaf|waf\\.php$)\">\n    Order allow,deny\n    Deny from all\n</FilesMatch>\n", LOCK_EX);
-            echo "[+] .htaccess: WAF files protected\n";
+        if (strpos($h, 'Deny from all') === false || strpos($h, '.pwaf_ptr') === false) {
+            // Remove old protection block if any
+            $h = preg_replace('/\n?<FilesMatch[^>]*\\.pwaf[^>]*>.*?<\/FilesMatch>\n?/s', '', $h);
+            $h .= "\n<FilesMatch \"^(\\.pwaf_ptr|waf\\.php$)\">\n    Order allow,deny\n    Deny from all\n</FilesMatch>\n";
+            // Also deny access to the random data directory
+            $h .= "<DirectoryMatch \"" . preg_quote($rand_name, '"') . "\">\n    Order allow,deny\n    Deny from all\n</DirectoryMatch>\n";
+            file_put_contents($ht, $h, LOCK_EX);
+            echo "[+] .htaccess: WAF files protected (.pwaf_ptr + $rand_name)\n";
         }
     }
 
@@ -2701,26 +2888,27 @@ function pwaf_install(array $argv): void {
     pwaf_deploy_watcher($wr, true);
 
     // L7: Deploy LD_PRELOAD .so (auto-compile)
-    if (PHP_OS_FAMILY !== 'Windows') {
+    if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
         echo "\n";
         pwaf_deploy_ldpreload($wr);
     }
 
     // L8: chattr +i immutable protection on core files
-    if (PHP_OS_FAMILY !== 'Windows') {
+    if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
         echo "\n[*] Applying chattr +i immutable protection...\n";
-        $protect_files = [
-            $dst,                       // waf.php
-            $wr . '/.pwaf.php',         // config
-            $wr . '/.pwaf_bak.php',     // backup
-        ];
+        $protect_files = array(
+            $dst,                                 // waf.php (in webroot)
+            $wr . '/.pwaf_ptr',                   // pointer file
+            $datadir . '/.pwaf.php',              // config (in random dir)
+            $datadir . '/.pwaf_bak.php',          // backup (in random dir)
+        );
         // Also protect .htaccess and .user.ini if they exist
         if (file_exists($wr . '/.htaccess'))  $protect_files[] = $wr . '/.htaccess';
         if (file_exists($wr . '/.user.ini'))  $protect_files[] = $wr . '/.user.ini';
-        // Protect waf.so if it was compiled
-        if (file_exists($wr . '/waf.so'))     $protect_files[] = $wr . '/waf.so';
+        // Protect waf.so if it was deployed
+        if (file_exists($datadir . '/waf.so'))     $protect_files[] = $datadir . '/waf.so';
         // Protect the watcher script
-        if (file_exists($wr . '/.pwaf_watcher.sh')) $protect_files[] = $wr . '/.pwaf_watcher.sh';
+        if (file_exists($datadir . '/.pwaf_watcher.sh')) $protect_files[] = $datadir . '/.pwaf_watcher.sh';
 
         $locked = 0;
         foreach ($protect_files as $pf) {
@@ -2756,10 +2944,10 @@ function pwaf_install(array $argv): void {
 // ── L6: inotifywait-based kernel file watcher ────────────────────────────────
 // Deploys a bash script that uses inotifywait (inotify-tools) for event-driven
 // file monitoring — zero CPU idle cost, instant response to filesystem changes
-function pwaf_deploy_watcher(string $wr, bool $silent = false): void {
+function pwaf_deploy_watcher($wr, $silent = false) {
     $wr = rtrim(realpath($wr) ?: $wr, '/\\');
     if (!is_dir($wr)) { if (!$silent) echo "[!] Not a directory: $wr\n"; return; }
-    if (PHP_OS_FAMILY === 'Windows') { if (!$silent) echo "[i] L6: inotifywait not available on Windows\n"; return; }
+    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') { if (!$silent) echo "[i] L6: inotifywait not available on Windows\n"; return; }
 
     $watcher_path = $wr . '/.pwaf_watcher.sh';
     $log_path     = $wr . '/.pwaf_log';
@@ -2944,16 +3132,31 @@ BASH;
     if (!$silent) echo "    Script:   $watcher_path\n";
 }
 
-function pwaf_uninstall(string $wr): void {
+function pwaf_uninstall($wr) {
     $wr  = rtrim(realpath($wr) ?: $wr, '/\\');
     $dst = $wr . '/waf.php';
     echo "[*] Uninstalling from $wr ...\n";
 
+    // Resolve data directory from pointer file
+    $ptr = $wr . '/.pwaf_ptr';
+    $datadir = '';
+    if (file_exists($ptr)) {
+        $dir = trim(file_get_contents($ptr));
+        if ($dir !== '' && is_dir($wr . '/' . $dir)) {
+            $datadir = $wr . '/' . $dir;
+        }
+    }
+
     // Remove chattr +i immutable flag before any file operations
-    if (PHP_OS_FAMILY !== 'Windows') {
+    if (strtoupper(substr(PHP_OS, 0, 3)) !== 'WIN') {
         echo "[*] Removing chattr immutable flags...\n";
-        $immutable_files = [$dst, '.pwaf.php', '.pwaf_bak.php', '.htaccess', '.user.ini',
-                           'waf.so', '.pwaf_watcher.sh'];
+        $immutable_files = array($dst, $ptr, '.htaccess', '.user.ini');
+        if ($datadir) {
+            $immutable_files[] = $datadir . '/.pwaf.php';
+            $immutable_files[] = $datadir . '/.pwaf_bak.php';
+            $immutable_files[] = $datadir . '/waf.so';
+            $immutable_files[] = $datadir . '/.pwaf_watcher.sh';
+        }
         foreach ($immutable_files as $f) {
             $fp = (strpos($f, '/') === 0) ? $f : $wr . '/' . $f;
             if (file_exists($fp)) {
@@ -2963,7 +3166,7 @@ function pwaf_uninstall(string $wr): void {
     }
 
     // Kill watcher process if running
-    $pid_file = $wr . '/.pwaf_watcher.pid';
+    $pid_file = $datadir ? ($datadir . '/.pwaf_watcher.pid') : ($wr . '/.pwaf_watcher.pid');
     if (file_exists($pid_file)) {
         $wpid = trim(@file_get_contents($pid_file));
         if ($wpid && is_numeric($wpid)) {
@@ -2990,31 +3193,61 @@ function pwaf_uninstall(string $wr): void {
     if (file_exists($ht)) {
         $c = preg_replace('/^php_value auto_prepend_file.*\n?/m', '', file_get_contents($ht));
         $c = preg_replace('/<FilesMatch[^>]*>.*?<\/FilesMatch>\n?/s', '', $c);
+        $c = preg_replace('/<DirectoryMatch[^>]*>.*?<\/DirectoryMatch>\n?/s', '', $c);
         file_put_contents($ht, $c, LOCK_EX);
         echo "[+] Cleaned .htaccess\n";
     }
-    foreach ([$dst,'.pwaf.php','.pwaf_log','.pwaf_bak.php','.pwaf_cnt','.pwaf_rate',
-              '.pwaf_int','.pwaf_chk','.pwaf_watcher.sh','.pwaf_watcher.pid','waf.so'] as $f) {
+
+    // Remove data directory contents and directory itself
+    if ($datadir && is_dir($datadir)) {
+        $di = new DirectoryIterator($datadir);
+        foreach ($di as $item) {
+            if ($item->isDot()) continue;
+            @unlink($item->getPathname());
+        }
+        @rmdir($datadir);
+        echo "[+] Removed data directory: $datadir\n";
+    }
+    // Remove pointer file
+    if (file_exists($ptr)) { @unlink($ptr); echo "[+] Removed: $ptr\n"; }
+    // Remove legacy files in webroot (backward compat cleanup)
+    foreach (array($dst, '.pwaf.php', '.pwaf_log', '.pwaf_bak.php', '.pwaf_cnt', '.pwaf_rate',
+              '.pwaf_int', '.pwaf_chk', '.pwaf_watcher.sh', '.pwaf_watcher.pid', 'waf.so') as $f) {
         $fp = (strpos($f, '/') === 0 || strpos($f, '\\') === 0) ? $f : $wr . '/' . $f;
         if (file_exists($fp)) { @unlink($fp); echo "[+] Removed: $fp\n"; }
     }
     echo "[+] Done.\n";
 }
 
-function pwaf_status(string $wr): void {
+function pwaf_status($wr) {
     $wr  = rtrim(realpath($wr) ?: $wr, '/\\');
     $dst = $wr . '/waf.php';
-    $cp  = $wr . '/.pwaf.php';
+    // Resolve data directory from pointer file
+    $ptr = $wr . '/.pwaf_ptr';
+    $cp  = '';
+    $datadir = '';
+    if (file_exists($ptr)) {
+        $dir = trim(file_get_contents($ptr));
+        if ($dir !== '' && is_dir($wr . '/' . $dir)) {
+            $datadir = $wr . '/' . $dir;
+            $cp = $datadir . '/.pwaf.php';
+        }
+    }
+    if (!$cp || !file_exists($cp)) {
+        $cp = $wr . '/.pwaf.php';  // legacy fallback
+    }
     echo "PhoenixWAF Status — $wr\n";
     echo "  waf.php  : " . (file_exists($dst) ? '[OK]' : '[MISSING]') . "\n";
+    echo "  pointer  : " . (file_exists($ptr) ? '[OK] -> ' . ($datadir ? basename($datadir) : '?') : '[NOT SET]') . "\n";
+    echo "  datadir  : " . ($datadir ? $datadir : '(none)') . "\n";
     echo "  config   : " . (file_exists($cp)  ? '[OK]' : '[MISSING]') . "\n";
     if (file_exists($cp)) {
         $cfg = include $cp;
         echo "  enabled  : " . ($cfg['enabled'] ? 'YES' : 'NO') . "\n";
-        $lp = $cfg['log'] ?? '';
+        $lp = (isset($cfg['log']) ? $cfg['log'] : '');
         if (file_exists($lp)) echo "  log lines: " . count(file($lp, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES)) . "\n";
-        echo "  blacklist: " . count($cfg['blacklist']??[]) . " IPs\n";
-        echo "  checkers : " . count($cfg['checker_ips']??[]) . " IPs\n";
+        echo "  blacklist: " . count((isset($cfg['blacklist']) ? $cfg['blacklist'] : array())) . " IPs\n";
+        echo "  checkers : " . count((isset($cfg['checker_ips']) ? $cfg['checker_ips'] : array())) . " IPs\n";
     }
     $ui = $wr . '/.user.ini';
     echo "  .user.ini: " . (file_exists($ui) && strpos(file_get_contents($ui),'auto_prepend_file')!==false ? '[OK]' : '[NOT SET]') . "\n";
@@ -3023,14 +3256,16 @@ function pwaf_status(string $wr): void {
     $files = pwaf_php_files($wr, $dst); $inj = 0;
     foreach ($files as $f) { if (strpos(file_get_contents($f), PWAF_MARKER) !== false) $inj++; }
     echo "  injected : $inj / " . count($files) . " PHP files\n";
-    echo "  watcher  : " . (file_exists($wr.'/.pwaf_watcher.sh') ? '[DEPLOYED]' : '[NOT DEPLOYED]') . "\n";
-    if (file_exists($wr.'/.pwaf_watcher.pid')) {
-        $wpid = trim(file_get_contents($wr.'/.pwaf_watcher.pid'));
+    $watcher_sh = $datadir ? ($datadir . '/.pwaf_watcher.sh') : ($wr . '/.pwaf_watcher.sh');
+    $watcher_pid = $datadir ? ($datadir . '/.pwaf_watcher.pid') : ($wr . '/.pwaf_watcher.pid');
+    echo "  watcher  : " . (file_exists($watcher_sh) ? '[DEPLOYED]' : '[NOT DEPLOYED]') . "\n";
+    if (file_exists($watcher_pid)) {
+        $wpid = trim(file_get_contents($watcher_pid));
         echo "  watcher PID: $wpid (" . (file_exists("/proc/$wpid") ? 'running' : 'stopped') . ")\n";
     }
 }
 
-function pwaf_baseline_cli(string $wr): void {
+function pwaf_baseline_cli($wr) {
     $wr = rtrim(realpath($wr) ?: $wr, '/\\');
     $cp = $wr . '/.pwaf.php';
     if (!file_exists($cp)) { echo "[!] Config not found. Run --install first.\n"; exit(1); }
@@ -3043,7 +3278,7 @@ function pwaf_baseline_cli(string $wr): void {
 // SECTION 8: HELPERS
 // =============================================================================
 
-function pwaf_php_files(string $wr, string $exclude): array {
+function pwaf_php_files($wr, $exclude) {
     $files = []; $skip = ['waf.php'];
     try {
         $iter = new RecursiveIteratorIterator(
@@ -3064,7 +3299,7 @@ function pwaf_php_files(string $wr, string $exclude): array {
     return $files;
 }
 
-function pwaf_rand(int $n): string {
+function pwaf_rand($n) {
     $c = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
     $o = '';
     for ($i = 0; $i < $n; $i++) $o .= $c[random_int(0, strlen($c)-1)];
@@ -3072,7 +3307,7 @@ function pwaf_rand(int $n): string {
 }
 
 // 生成与真 flag 同长度的随机假 flag（更难辨别）
-function pwaf_same_length_fake(string $real_flag, string $fallback_fake): string {
+function pwaf_same_length_fake($real_flag, $fallback_fake) {
     $len = strlen($real_flag);
     if ($len < 7) return $fallback_fake; // 太短不像 flag
     // 保留 flag{ 和 }，中间用随机字符填充
@@ -3084,71 +3319,70 @@ function pwaf_same_length_fake(string $real_flag, string $fallback_fake): string
     return 'flag{' . $inner . '}';
 }
 
-// ── LD_PRELOAD .so 生成 ─────────────────────────────────────────────────────
-// 生成 waf.c 源文件并编译为 waf.so（需要 Linux + gcc）
-// ── LD_PRELOAD: Precompiled .so deployment ───────────────────────────────────
-// Deploys a precompiled shared library that hooks dangerous libc functions
-// (execve, unlink, rename, chmod) to protect WAF files and block RCE at OS level.
+// ── LD_PRELOAD: .so deployment ───────────────────────────────────────────────
+// Deploys a shared library (.so) that hooks dangerous libc functions at OS level.
+// Two strategies (in priority order):
+//   A. Copy pre-compiled waf_<arch>.so shipped next to waf.php into the data directory
+//   B. Generate C source in data directory, compile with gcc/cc/musl-gcc on host
 //
-// 部署策略（按优先级）：
-//   1. 检查 config 中缓存的 base64 二进制（之前编译过的，适配当前架构）
-//   2. 尝试 gcc/cc 本地编译，编译成功后将 .so 的 base64 缓存到 config
-//      后续部署到同架构机器时直接释放，无需再次编译
-//   3. 全部失败时保留 C 源码供手动编译
+// The .so intercepts 6 syscalls:
+//   - execve():   blocks commands containing dangerous keywords + envp LD_PRELOAD override
+//   - unlink():   prevents deletion of WAF core files
+//   - rename():   prevents renaming of protected files
+//   - chmod():    prevents stripping permissions on protected files
+//   - remove():   prevents remove() on protected files
+//   - truncate(): prevents truncating protected files to zero
 //
-// The .so intercepts:
-//   - execve(): blocks commands containing flag/shadow/passwd/LD_PRELOAD keywords
-//   - unlink(): prevents deletion of waf.php / .pwaf* / .htaccess
-//   - rename(): prevents renaming of protected files
-//   - chmod():  prevents stripping permissions on protected files
-//
-// 使用: php waf.php --ldpreload /var/www/html
-function pwaf_deploy_ldpreload(string $wr): void {
-    $wr = rtrim(realpath($wr) ?: $wr, '/\\');
-    if (PHP_OS_FAMILY === 'Windows') {
+// Usage: php waf.php --ldpreload /var/www/html
+function pwaf_deploy_ldpreload($wr) {
+    $wr = rtrim(realpath($wr) ? realpath($wr) : $wr, '/\\');
+    if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
         echo "[!] LD_PRELOAD is Linux-only. Cannot deploy on Windows.\n";
         echo "[i] Copy waf.php to your Linux server and run:\n";
         echo "    php waf.php --ldpreload /var/www/html\n";
         return;
     }
 
-    $so_path  = $wr . '/waf.so';
-    $log_path = $wr . '/.pwaf_log';
-    $cfg_path = $wr . '/.pwaf.php';
+    // ── Resolve paths via data directory system ──
+    $cfg_path = pwaf_cfg_path();
+    $cfg = file_exists($cfg_path) ? (include $cfg_path) : array();
+    $datadir  = pwaf_datadir($cfg);
+    if (!is_dir($datadir)) @mkdir($datadir, 0700, true);
+    $so_path  = $datadir . '/waf.so';
+    $log_path = isset($cfg['log']) ? $cfg['log'] : ($datadir . '/.pwaf_log');
 
     // ── Detect architecture ──
     $arch = trim(@exec('uname -m 2>/dev/null'));
     echo "[*] Architecture: $arch\n";
+    echo "[*] Data directory: $datadir\n";
 
-    // ── 策略 1: 从 config 中释放缓存的 base64 .so ──
-    $deployed_from_cache = false;
-    if (file_exists($cfg_path)) {
-        $cfg = include $cfg_path;
-        $cache_key = 'ldpreload_bin_' . $arch;
-        if (!empty($cfg[$cache_key])) {
-            $bin = base64_decode($cfg[$cache_key], true);
-            if ($bin !== false && strlen($bin) > 1000) {
-                file_put_contents($so_path, $bin, LOCK_EX);
-                @chmod($so_path, 0755);
-                echo "[+] Deployed from cached binary ($arch): $so_path (" . strlen($bin) . " bytes)\n";
-                echo "[+] No compilation needed — using previously cached .so\n";
-                $deployed_from_cache = true;
-            }
+    // ── Strategy A: copy pre-compiled waf_<arch>.so from beside waf.php ──
+    $deployed = false;
+    $precompiled = dirname(PWAF_SELF) . '/waf_' . $arch . '.so';
+    if (file_exists($precompiled)) {
+        if (@copy($precompiled, $so_path)) {
+            @chmod($so_path, 0755);
+            echo "[+] Deployed pre-compiled .so: $precompiled -> $so_path\n";
+            $deployed = true;
+        } else {
+            echo "[!] Found $precompiled but failed to copy to $so_path\n";
         }
+    } else {
+        echo "[*] No pre-compiled .so found at $precompiled\n";
     }
 
-    // ── 策略 2: 本地编译 + 缓存 base64 到 config ──
-    if (!$deployed_from_cache) {
-        echo "[*] No cached binary for $arch, attempting compilation...\n";
+    // ── Strategy B: compile from embedded C source ──
+    if (!$deployed) {
+        echo "[*] Attempting on-host compilation...\n";
 
-        $c_path = $wr . '/.pwaf_so_build.c';
+        $c_path = $datadir . '/.pwaf_so_build.c';
         $log_escaped = addcslashes($log_path, '"\\');
         $wr_escaped  = addcslashes($wr, '"\\');
 
         $c_source = <<<'CSRC_HEAD'
 /*
  * PhoenixWAF LD_PRELOAD Protection v3
- * Hooks: execve, unlink, rename, chmod
+ * Hooks: execve, unlink, rename, chmod, remove, truncate
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -3158,26 +3392,35 @@ function pwaf_deploy_ldpreload(string $wr): void {
 #include <dlfcn.h>
 #include <time.h>
 #include <errno.h>
+#include <sys/types.h>
 
 CSRC_HEAD;
 
-        // Inject runtime paths
-        $c_source .= "static const char *LOG_PATH = \"$log_escaped\";\n";
-        $c_source .= "static const char *WEBROOT = \"$wr_escaped\";\n\n";
+        // Inject runtime paths via #ifndef (overridable with -D at compile time)
+        $c_source .= "#ifndef PWAF_LOG_PATH\n";
+        $c_source .= "#define PWAF_LOG_PATH \"$log_escaped\"\n";
+        $c_source .= "#endif\n";
+        $c_source .= "#ifndef PWAF_WEBROOT\n";
+        $c_source .= "#define PWAF_WEBROOT \"$wr_escaped\"\n";
+        $c_source .= "#endif\n";
+        $c_source .= "static const char *LOG_PATH = PWAF_LOG_PATH;\n";
+        $c_source .= "static const char *WEBROOT  = PWAF_WEBROOT;\n\n";
 
         $c_source .= <<<'CSRC_BODY'
 // ── Blocked keywords for execve ──
 static const char *exec_blocked[] = {
     "flag", "LD_PRELOAD", "waf.so", "waf.php", ".pwaf",
-    "/dev/tcp/", "nc -e", "mkfifo", "/etc/shadow", "/etc/passwd",
-    "curl.*evil", "wget.*evil", "base64.*decode",
+    "/dev/tcp/", "nc -e", "nc -lp", "ncat -e", "mkfifo",
+    "/etc/shadow", "/etc/passwd", "base64.*decode",
+    "python -c", "python3 -c", "perl -e", "ruby -e", "php -r",
     NULL
 };
 
-// ── Protected filenames (unlink/rename/chmod protection) ──
+// ── Protected filenames (unlink/rename/chmod/remove/truncate protection) ──
 static const char *protected_names[] = {
     "waf.php", ".pwaf.php", ".pwaf_bak.php", ".htaccess", ".user.ini",
-    "waf.so", ".pwaf_watcher.sh", ".pwaf_log", ".pwaf_int",
+    "waf.so", ".pwaf_watcher.sh", ".pwaf_watcher.pid",
+    ".pwaf_log", ".pwaf_int", ".pwaf_rate",
     NULL
 };
 
@@ -3238,6 +3481,17 @@ int execve(const char *filename, char *const argv[], char *const envp[]) {
             }
         }
     }
+    // Check envp for LD_PRELOAD override attempts
+    if (envp) {
+        for (int i = 0; envp[i]; i++) {
+            if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0 &&
+                strstr(envp[i], "waf.so") == NULL) {
+                pwaf_log("execve", "LD_PRELOAD override attempt");
+                errno = EACCES;
+                return -1;
+            }
+        }
+    }
     return real_execve(filename, argv, envp);
 }
 
@@ -3260,12 +3514,30 @@ int rename(const char *oldpath, const char *newpath) {
 }
 
 // ── Hook: chmod ──
-typedef int (*real_chmod_t)(const char *, unsigned int);
-int chmod(const char *pathname, unsigned int mode) {
+typedef int (*real_chmod_t)(const char *, mode_t);
+int chmod(const char *pathname, mode_t mode) {
     real_chmod_t real_chmod = (real_chmod_t)dlsym(RTLD_NEXT, "chmod");
     if (!real_chmod) { errno = EACCES; return -1; }
     if (is_protected(pathname)) { pwaf_log("chmod", pathname); errno = EPERM; return -1; }
     return real_chmod(pathname, mode);
+}
+
+// ── Hook: remove ──
+typedef int (*real_remove_t)(const char *);
+int remove(const char *pathname) {
+    real_remove_t real_remove = (real_remove_t)dlsym(RTLD_NEXT, "remove");
+    if (!real_remove) { errno = EACCES; return -1; }
+    if (is_protected(pathname)) { pwaf_log("remove", pathname); errno = EPERM; return -1; }
+    return real_remove(pathname);
+}
+
+// ── Hook: truncate ──
+typedef int (*real_truncate_t)(const char *, off_t);
+int truncate(const char *path, off_t length) {
+    real_truncate_t real_truncate = (real_truncate_t)dlsym(RTLD_NEXT, "truncate");
+    if (!real_truncate) { errno = EACCES; return -1; }
+    if (is_protected(path) && length == 0) { pwaf_log("truncate", path); errno = EPERM; return -1; }
+    return real_truncate(path, length);
 }
 
 // ── Constructor ──
@@ -3280,11 +3552,14 @@ CSRC_BODY;
         echo "[+] Generated C source: $c_path\n";
 
         // Try to compile with gcc, cc, or musl-gcc
-        $compilers = ['gcc', 'cc', 'musl-gcc'];
+        $compilers = array('gcc', 'cc', 'musl-gcc');
         $compiled = false;
         foreach ($compilers as $cc) {
-            $gcc_cmd = "$cc -shared -fPIC -O2 -s -o " . escapeshellarg($so_path) . " " . escapeshellarg($c_path) . " -ldl 2>&1";
-            $output = [];
+            $gcc_cmd = "$cc -shared -fPIC -O2 -s"
+                . " -DPWAF_LOG_PATH='\"" . addcslashes($log_path, '"\\') . "\"'"
+                . " -DPWAF_WEBROOT='\"" . addcslashes($wr, '"\\') . "\"'"
+                . " -o " . escapeshellarg($so_path) . " " . escapeshellarg($c_path) . " -ldl 2>&1";
+            $output = array();
             $ret = 0;
             exec($gcc_cmd, $output, $ret);
             if ($ret === 0) {
@@ -3298,50 +3573,47 @@ CSRC_BODY;
             echo "[!] No compiler available (tried: " . implode(', ', $compilers) . ")\n";
             echo "[i] Install gcc: apt-get install -y gcc\n";
             echo "[i] C source kept at: $c_path\n";
-            echo "[i] Compile manually: gcc -shared -fPIC -O2 -s -o $so_path $c_path -ldl\n";
+            echo "[i] Compile manually:\n";
+            echo "    gcc -shared -fPIC -O2 -s -DPWAF_LOG_PATH='\"$log_path\"' -DPWAF_WEBROOT='\"$wr\"' -o $so_path $c_path -ldl\n";
             return;
         }
 
-        // Clean up C source
+        // Clean up C source on success
         @unlink($c_path);
         echo "[+] Cleaned up C source\n";
 
         // Set permissions
         @chmod($so_path, 0755);
-
-        // Cache compiled binary as base64 in config for future deployments
-        $bin_content = @file_get_contents($so_path);
-        if ($bin_content !== false) {
-            $b64 = base64_encode($bin_content);
-            echo "[+] Caching compiled .so as base64 in config (" . strlen($bin_content) . " bytes, arch=$arch)\n";
-            echo "    Future deployments on $arch will skip compilation entirely.\n";
-            if (file_exists($cfg_path)) {
-                $cfg = include $cfg_path;
-                $cfg['ldpreload_bin_' . $arch] = $b64;
-                $cfg['ldpreload_bin_arch'] = $arch;
-            }
-        }
+        $deployed = true;
     }
 
-    // Update config with path and enable
-    if (file_exists($cfg_path)) {
-        if (!isset($cfg)) $cfg = include $cfg_path;
-        $cfg['ldpreload_path'] = $so_path;
-        $cfg['ldpreload_enabled'] = true;
-        pwaf_save_cfg($cfg);
-        echo "[+] Config updated: LD_PRELOAD enabled\n";
+    if (!$deployed) {
+        echo "[!] Failed to deploy waf.so via any strategy.\n";
+        return;
     }
 
-    echo "\n[*] 使用方法：\n";
-    echo "    方法 A (推荐): WAF 运行时自动设置 LD_PRELOAD\n";
-    echo "    方法 B: export LD_PRELOAD=$so_path\n";
-    echo "    方法 C: 在 php.ini/php-fpm.conf 中添加:\n";
-    echo "            env[LD_PRELOAD] = $so_path\n";
-    echo "\n[*] Hook 功能：\n";
-    echo "    ✓ execve  — 拦截危险命令执行 (flag/shadow/passwd/反弹shell)\n";
-    echo "    ✓ unlink  — 阻止删除 WAF 核心文件\n";
-    echo "    ✓ rename  — 阻止重命名 WAF 文件\n";
-    echo "    ✓ chmod   — 阻止修改 WAF 文件权限\n";
+    // ── Update config with path and enable ──
+    $cfg['ldpreload_path'] = $so_path;
+    $cfg['ldpreload_enabled'] = true;
+    // Remove legacy base64 cache keys if present
+    foreach (array_keys($cfg) as $k) {
+        if (strpos($k, 'ldpreload_bin_') === 0) unset($cfg[$k]);
+    }
+    pwaf_save_cfg($cfg);
+    echo "[+] Config updated: LD_PRELOAD enabled\n";
+
+    echo "\n[*] Usage:\n";
+    echo "    Method A (recommended): WAF auto-sets LD_PRELOAD at runtime\n";
+    echo "    Method B: export LD_PRELOAD=$so_path\n";
+    echo "    Method C: Add to php.ini or php-fpm pool config:\n";
+    echo "              env[LD_PRELOAD] = $so_path\n";
+    echo "\n[*] Hooked syscalls:\n";
+    echo "    + execve   - blocks dangerous command execution (flag/shadow/passwd/reverse shell)\n";
+    echo "    + unlink   - prevents deletion of WAF core files\n";
+    echo "    + rename   - prevents renaming of protected files\n";
+    echo "    + chmod    - prevents stripping permissions on protected files\n";
+    echo "    + remove   - prevents remove() on protected files\n";
+    echo "    + truncate - prevents truncating protected files to zero\n";
 }
 
 
