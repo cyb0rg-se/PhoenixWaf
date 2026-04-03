@@ -1,6 +1,6 @@
 <?php
 /**
- * PhoenixWAF v3.0 — AWD PHP 最强通防
+ * PhoenixWAF v3.0 — AWD PHP 通防
  *
  * 部署: php waf.php --install /var/www/html [--password pass] [--key key]
  * 面板: http://host/any.php?waf_key=KEY  (需密码登录)
