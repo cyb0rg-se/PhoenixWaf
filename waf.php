@@ -1,6 +1,6 @@
 <?php
 /**
- * PhoenixWAF v3.0 — AWD PHP 最强通防
+ * PhoenixWAF v3.4 — AWD PHP 通防
  *
  * 部署: php waf.php --install /var/www/html [--password pass] [--key key]
  * 面板: http://host/any.php?waf_key=KEY  (需密码登录)
@@ -1894,6 +1894,17 @@ function pwaf_panel(array &$cfg, $ip) {
                 $cfg['forward_targets'] = $targets;
                 pwaf_save_cfg($cfg);
                 break;
+
+            // ── 保存盲打收割配置 ──────────────────────────────────────────────────
+            case 'save_autoreap':
+                $cfg['autoreap_enabled'] = !empty($GLOBALS['_PWAF_POST']['autoreap_enabled']);
+                $cfg['autoreap_ip_start'] = trim((isset($GLOBALS['_PWAF_POST']['autoreap_ip_start']) ? $GLOBALS['_PWAF_POST']['autoreap_ip_start'] : ''));
+                $cfg['autoreap_ip_end'] = trim((isset($GLOBALS['_PWAF_POST']['autoreap_ip_end']) ? $GLOBALS['_PWAF_POST']['autoreap_ip_end'] : ''));
+                $cfg['autoreap_port_start'] = trim((isset($GLOBALS['_PWAF_POST']['autoreap_port_start']) ? $GLOBALS['_PWAF_POST']['autoreap_port_start'] : '80'));
+                $cfg['autoreap_port_end'] = trim((isset($GLOBALS['_PWAF_POST']['autoreap_port_end']) ? $GLOBALS['_PWAF_POST']['autoreap_port_end'] : '80'));
+                pwaf_save_cfg($cfg);
+                break;
+
             // ── 自动提交 flag ───────────────────────────────────────────────────
             case 'save_flagsub':
                 $cfg['flagsub_enabled']  = !empty($GLOBALS['_PWAF_POST']['flagsub_enabled']);
@@ -2085,7 +2096,7 @@ textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.
   <div class="nav-item" onclick="showTab('forward',this)"><span class="nav-icon">&#x21C4;</span> 流量转发</div>
   <div class="nav-item" onclick="showTab('flagsub',this)"><span class="nav-icon">&#x2691;</span> 自动提交</div>
   <div class="nav-item" onclick="showTab('replay',this)"><span class="nav-icon">&#x21BA;</span> 流量重放</div>
-  <div class="nav-item" onclick="showTab('autoreap',this)"><span class="nav-icon">&#x221E;</span> 全流量盲打</div>
+  <div class="nav-item" onclick="showTab('autoreap',this)"><span class="nav-icon">&#x221E;</span> 全流量(支持盲打/搅屎)</div>
   <div class="sidebar-footer" style="color:var(--text2);font-size:11px">&#x25CF; 会话有效</div>
 </div>
 <!-- main -->
@@ -2603,64 +2614,79 @@ if (file_exists($fl)):
     <div style="color:var(--text2);font-size:12px;margin-bottom:14px;line-height:1.8">
       此处实时监控到达本服务器的<b>所有 HTTP 请求</b>（包含被拦截的攻击与放行的正常流量）。点击<code style="color:var(--accent);">详情</code>可查看完整请求报文。<br>
       
-      <details style="background:#060a14;border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-top:8px;outline:none;">
-        <summary style="cursor:pointer;color:#f97316;font-weight:bold;outline:none;user-select:none;">&#x25B6; 展开高级功能：全流量自动盲打收割 (躺平模式)</summary>
-        <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:20px;border-top:1px dashed var(--border);padding-top:12px;">
-          <div>
-            <div style="color:var(--text2);font-size:11px;margin-bottom:6px">盲打目标 IP 与端口范围</div>
-            <div style="margin-bottom:8px">
-              <input type="text" id="auto-ip-start" placeholder="192.168.1.1" style="width:130px"> — 
-              <input type="text" id="auto-ip-end" placeholder="192.168.1.20" style="width:130px">
+      <details style="background:#060a14;border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-top:8px;outline:none;" <?= !empty($cfg['autoreap_enabled']) ? 'open' : '' ?>>
+        <summary style="cursor:pointer;color:#f97316;font-weight:bold;outline:none;user-select:none;">&#x25B6; 展开高级功能：全流量自动盲打收割配置</summary>
+        <form method="post" action="<?= $e($self) ?>">
+          <input type="hidden" name="waf_key" value="<?= $e($key) ?>">
+          <input type="hidden" name="act" value="save_autoreap">
+          <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:20px;border-top:1px dashed var(--border);padding-top:12px;">
+            <div>
+              <div style="color:var(--text2);font-size:11px;margin-bottom:6px">盲打目标 IP 与端口范围</div>
+              <div style="margin-bottom:8px">
+                <input type="text" name="autoreap_ip_start" value="<?= $e(isset($cfg['autoreap_ip_start']) ? $cfg['autoreap_ip_start'] : '') ?>" placeholder="192.168.1.1" style="width:130px"> — 
+                <input type="text" name="autoreap_ip_end" value="<?= $e(isset($cfg['autoreap_ip_end']) ? $cfg['autoreap_ip_end'] : '') ?>" placeholder="192.168.1.20" style="width:130px">
+              </div>
+              <div style="margin-bottom:8px">
+                <span style="color:var(--text2);font-size:11px;margin-right:6px">端口:</span>
+                <input type="text" name="autoreap_port_start" value="<?= $e(isset($cfg['autoreap_port_start']) ? $cfg['autoreap_port_start'] : '80') ?>" placeholder="80" style="width:60px"> — 
+                <input type="text" name="autoreap_port_end" value="<?= $e(isset($cfg['autoreap_port_end']) ? $cfg['autoreap_port_end'] : '80') ?>" placeholder="80" style="width:60px">
+              </div>
+              <button type="submit" class="btn bo" style="margin-top:6px;padding:4px 10px;">保存盲打配置</button>
             </div>
-            <div style="margin-bottom:8px">
-              <span style="color:var(--text2);font-size:11px;margin-right:6px">端口:</span>
-              <input type="text" id="auto-port-start" placeholder="80" style="width:60px" value="80"> — 
-              <input type="text" id="auto-port-end" placeholder="80" style="width:60px" value="80">
-            </div>
-            <div style="color:var(--text2);font-size:10px;line-height:1.5;">
-              <span style="color:#f87171">警告：开启此功能会将本机收到的所有流量广播给全场。</span><br>
-              若目标机器吐出 Flag，系统将调用“自动提交 Flag”模块的配置进行静默提交。
+            <div style="display:flex;flex-direction:column;justify-content:center">
+              <div style="margin-bottom:12px;display:flex;align-items:center;">
+                <label class="toggle-switch" style="margin-right:10px">
+                  <input type="checkbox" name="autoreap_enabled" value="1" <?= !empty($cfg['autoreap_enabled']) ? 'checked' : '' ?> onchange="toggleAutoReapUI(this.checked)">
+                  <span class="toggle-slider"></span>
+                </label>
+                <span id="auto-reap-status" style="font-weight:bold;color:var(--text2)">自动盲打: <?= !empty($cfg['autoreap_enabled']) ? '<span style="color:var(--red)">运行中...</span>' : '已关闭' ?></span>
+              </div>
+              <div style="color:var(--text2);font-size:10px;line-height:1.8;background:#0a0e1a;padding:8px;border-radius:4px;border:1px solid var(--border)">
+                待处理队列: <span id="auto-queue-count" style="color:var(--cyan);font-weight:bold;">0</span><br>
+                已广播请求: <span id="auto-sent-count" style="color:var(--accent);font-weight:bold;">0</span><br>
+                捕获并提交 Flag: <span id="auto-flag-count" style="color:var(--green);font-weight:bold;">0</span>
+              </div>
             </div>
           </div>
-          <div style="display:flex;flex-direction:column;justify-content:center">
-            <div style="margin-bottom:12px">
-              <label class="toggle-switch" style="vertical-align:middle;margin-right:10px">
-                <input type="checkbox" id="auto-reap-toggle" onchange="toggleAutoReap(this)">
-                <span class="toggle-slider"></span>
-              </label>
-              <span id="auto-reap-status" style="font-weight:bold;color:var(--text2)">自动盲打: 关闭</span>
-            </div>
-            <div style="color:var(--text2);font-size:10px;line-height:1.8;background:#0a0e1a;padding:8px;border-radius:4px;">
-              待处理队列: <span id="auto-queue-count" style="color:var(--cyan);font-weight:bold;">0</span><br>
-              已广播请求: <span id="auto-sent-count" style="color:var(--accent);font-weight:bold;">0</span><br>
-              捕获并提交 Flag: <span id="auto-flag-count" style="color:var(--green);font-weight:bold;">0</span>
-            </div>
-          </div>
-        </div>
+        </form>
       </details>
     </div>
 
     <div style="border:1px solid var(--border);border-radius:6px;background:#0a0e1a;">
-      <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;gap:20px;align-items:center;background:#0f1629;border-radius:6px 6px 0 0;">
+      <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;gap:16px;align-items:center;background:#0f1629;border-radius:6px 6px 0 0;flex-wrap:wrap;">
         <span style="color:var(--text2);font-size:11px;font-weight:bold;">视图过滤:</span>
-        <label style="font-size:11px;display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--text);">
-          <input type="checkbox" id="filter-self-ip" checked> 隐藏本机/管理员 IP
+        <select id="ft-filter-type" onchange="ftPage=1; renderFullTraffic()" style="background:#060a14;border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:11px;outline:none;">
+          <option value="all">全部流量</option>
+          <option value="pass">仅看放行</option>
+          <option value="block">仅看拦截</option>
+        </select>
+        <label style="font-size:11px;display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--text);">
+          <input type="checkbox" id="filter-self-ip" checked onchange="renderFullTraffic()"> 隐藏本机 IP
         </label>
-        <label style="font-size:11px;display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--text);">
-          <input type="checkbox" id="filter-ajax" checked> 隐藏 WAF 面板通讯
+        <label style="font-size:11px;display:flex;align-items:center;gap:4px;cursor:pointer;color:var(--text);">
+          <input type="checkbox" id="filter-ajax" checked onchange="renderFullTraffic()"> 隐藏 WAF 通讯
         </label>
+        
+        <div style="margin-left:auto;display:flex;align-items:center;gap:10px;">
+          <button type="button" class="btn bs" style="padding:2px 8px;font-size:10px" onclick="ftChangePage(-1)">&#x25C0;</button>
+          <span style="font-size:11px;color:var(--text2)" id="ft-page-info">1 / 1</span>
+          <button type="button" class="btn bs" style="padding:2px 8px;font-size:10px" onclick="ftChangePage(1)">&#x25B6;</button>
+        </div>
       </div>
 
       <table id="full-traffic-table" style="table-layout:fixed;width:100%;">
-
-        <tr>
-          <th style="width:70px">时间</th>
-          <th style="width:60px">状态</th>
-          <th style="width:110px">源 IP</th>
-          <th style="width:60px">方法</th>
-          <th>URI</th>
-          <th style="width:70px;text-align:center;">操作</th>
-        </tr>
+        <thead>
+          <tr>
+            <th style="width:70px">时间</th>
+            <th style="width:60px">状态</th>
+            <th style="width:150px">源 IP</th>
+            <th style="width:60px">方法</th>
+            <th>URI</th>
+            <th style="width:70px;text-align:center;">操作</th>
+          </tr>
+        </thead>
+        <tbody id="ft-tbody">
+          </tbody>
       </table>
     </div>
   </div>
@@ -2713,7 +2739,8 @@ document.addEventListener('DOMContentLoaded', function() {
     if (!actInput) return;
     
     var act = actInput.value;
-    var isConfigForm = ['save_forward', 'save_flagsub', 'fake_flag', 'save_openbasedir'].includes(act);
+    // var isConfigForm = ['save_forward', 'save_flagsub', 'fake_flag', 'save_openbasedir'].includes(act);
+    var isConfigForm = ['save_forward', 'save_flagsub', 'fake_flag', 'save_openbasedir', 'save_autoreap'].includes(act);
     var isRuleToggle = ['toggle_rule', 'toggle_custom_rule'].includes(act);
     
     if (isConfigForm || isRuleToggle) {
@@ -2758,7 +2785,8 @@ document.addEventListener('DOMContentLoaded', function() {
   });
 
   // 3. 流量转发与自动提交的开关，实现“即点即存”
-  document.querySelectorAll('input[name="forward_enabled"], input[name="flagsub_enabled"]').forEach(function(toggle) {
+  // document.querySelectorAll('input[name="forward_enabled"], input[name="flagsub_enabled"]').forEach(function(toggle) {
+  document.querySelectorAll('input[name="forward_enabled"], input[name="flagsub_enabled"], input[name="autoreap_enabled"]').forEach(function(toggle) {
     toggle.addEventListener('change', function() {
       this.closest('form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     });
@@ -2968,21 +2996,112 @@ async function pwafReplayBroadcast() {
   document.getElementById('replay-btn').style.display = ''; document.getElementById('replay-stop-btn').style.display = 'none';
 }
 
-// ── 全流量审计与盲打收割引擎 (_poll_full) ──────────────────────────────────
-var _autoReapEnabled = false;
+// ── 内存数据池引擎 (用于支持分页和筛选) ──────────────────────────────────
+var ftDataPool = [];
+var ftPage = 1;
+var ftPerPage = 15;
+var ftExpandedIds = new Set();
+var myIpStr = "<?= $ip ?>";
+var localIpsArr = ['127.0.0.1', '::1', 'WATCHER', 'SYS', '172.24.0.1']; 
+
+function renderFullTraffic() {
+  var filterType = document.getElementById('ft-filter-type').value;
+  var filterSelf = document.getElementById('filter-self-ip').checked;
+  var filterAjax = document.getElementById('filter-ajax').checked;
+  var tbody = document.getElementById('ft-tbody');
+  if (!tbody) return;
+
+  var filtered = ftDataPool.filter(function(ev) {
+    if (filterType === 'pass' && ev.action === 'block') return false;
+    if (filterType === 'block' && ev.action === 'pass') return false;
+    if (filterSelf && (ev.ip === myIpStr || localIpsArr.includes(ev.ip))) return false;
+    if (filterAjax && ev.uri && ev.uri.includes('waf_key=')) return false;
+    return true;
+  });
+
+  var totalPages = Math.ceil(filtered.length / ftPerPage) || 1;
+  if (ftPage > totalPages) ftPage = totalPages;
+  if (ftPage < 1) ftPage = 1;
+  document.getElementById('ft-page-info').textContent = ftPage + ' / ' + totalPages + ' (共' + filtered.length + '条)';
+
+  var start = (ftPage - 1) * ftPerPage;
+  var pageData = filtered.slice(start, start + ftPerPage);
+
+  var html = '';
+  var esc = function(s) { return String(s||'').replace(/[&<>'"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]; }); };
+
+  pageData.forEach(function(ev) {
+    var ts = new Date((ev.ts || 0) * 1000);
+    var timeStr = String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0') + ':' + String(ts.getSeconds()).padStart(2,'0');
+    var isBlock = ev.action === 'block';
+    var statusBadge = isBlock 
+        ? '<span class="b" style="background:#dc2626; color:#fff; border:1px solid #f87171; padding:2px 8px; box-shadow:0 0 8px rgba(220,38,38,0.4);">拦截</span>' 
+        : '<span class="b" style="background:#16a34a; color:#fff; border:1px solid #4ade80; padding:2px 8px; box-shadow:0 0 8px rgba(22,163,74,0.4);">放行</span>';
+    
+    var rawReq = (ev.method || 'GET') + ' ' + (ev.uri || '/') + " HTTP/1.1\n";
+    rawReq += "Host: <?= $_SERVER['HTTP_HOST'] ?? 'unknown' ?>\n";
+    if (ev.ua) rawReq += "User-Agent: " + ev.ua + "\n";
+    if (ev.referer) rawReq += "Referer: " + ev.referer + "\n";
+    if (ev.method === 'POST') rawReq += "Content-Type: application/x-www-form-urlencoded\n";
+    if (ev.post) rawReq += "\n" + ev.post;
+    
+    var detailHtml = '<div style="background:#030712;padding:12px;border-radius:6px;border:1px solid var(--border);font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;color:#e2e8f0;max-height:350px;overflow-y:auto;box-shadow:inset 0 0 10px rgba(0,0,0,0.5);">' + esc(rawReq) + '</div>';
+    if (isBlock) {
+      detailHtml += '<div style="margin-top:8px;padding:8px;background:rgba(220,38,38,0.1);border-left:3px solid #dc2626;color:#fca5a5;font-size:11px;"><b>[拦截触发]</b> 规则: <span class="b br">' + esc(ev.rule) + '</span> &nbsp;|&nbsp; <b>[恶意载荷]</b> ' + esc(ev.payload) + '</div>';
+    }
+
+    html += '<tr>' +
+      '<td style="white-space:nowrap;color:var(--text2);">' + timeStr + '</td>' +
+      '<td>' + statusBadge + '</td>' +
+      '<td>' + esc(ev.ip) + '</td>' +
+      '<td style="color:' + (ev.method==='POST'?'#f97316':'#38bdf8') + '; font-weight:bold;">' + esc(ev.method) + '</td>' +
+      '<td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap; color:' + (isBlock ? '#fca5a5' : 'inherit') + '" title="' + esc(ev.uri) + '">' + esc(ev.uri) + '</td>' +
+      '<td style="text-align:center;"><button type="button" class="btn ' + (isBlock ? 'br' : 'bs') + '" style="padding:2px 8px; font-size:10px;" onclick="toggleTrafficDetail(\'' + ev._id + '\')">详情</button></td>' +
+    '</tr>';
+    
+    var displayStyle = ftExpandedIds.has(ev._id) ? 'table-row' : 'none';
+    html += '<tr id="req-detail-' + ev._id + '" style="display:' + displayStyle + ';"><td colspan="6" style="padding:10px 16px;background:var(--card);">' + detailHtml + '</td></tr>';
+  });
+  
+  if(pageData.length === 0) {
+    html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--text2);">暂无匹配数据</td></tr>';
+  }
+  tbody.innerHTML = html;
+}
+
+function ftChangePage(delta) {
+  ftPage += delta;
+  renderFullTraffic();
+}
+
+function toggleTrafficDetail(id) {
+  var el = document.getElementById('req-detail-' + id);
+  if (el) {
+    if (el.style.display === 'none') { el.style.display = 'table-row'; ftExpandedIds.add(id); }
+    else { el.style.display = 'none'; ftExpandedIds.delete(id); }
+  }
+}
+
+// ── 盲打收割核心引擎 (读取后端保存的配置) ──────────────────────────────────
+var _autoReapEnabled = <?= !empty($cfg['autoreap_enabled']) ? 'true' : 'false' ?>;
 var _autoReapQueue = [];
 var _autoReapProcessing = false;
 var _processedIds = new Set();
 var _autoSentCount = 0;
 var _autoFlagCount = 0;
 
-function toggleAutoReap(checkbox) {
-  _autoReapEnabled = checkbox.checked;
+function toggleAutoReapUI(checked) {
+  _autoReapEnabled = checked;
   var statusText = document.getElementById('auto-reap-status');
-  if (_autoReapEnabled) { statusText.innerHTML = '<span style="color:var(--red)">运行中 (疯狂收割中...)</span>'; processAutoReapQueue(); } 
-  else { statusText.innerHTML = '已关闭'; }
+  if (_autoReapEnabled) {
+    statusText.innerHTML = '<span style="color:var(--red)">运行中 (疯狂收割中...)</span>';
+    processAutoReapQueue(); 
+  } else {
+    statusText.innerHTML = '已关闭';
+  }
 }
 
+// 轮询拉取全量流量并更新数据池
 setInterval(function() {
   var currentTab = localStorage.getItem('pwaf_active_tab');
   if (currentTab !== 'autoreap' && !_autoReapEnabled) return;
@@ -2992,59 +3111,36 @@ setInterval(function() {
     .then(function(data) {
       if (!data || !data.length) return;
       
-      var expandedIds = new Set();
-      document.querySelectorAll('tr[id^="req-detail-"]').forEach(function(tr) {
-        if (tr.style.display !== 'none') expandedIds.add(tr.id.replace('req-detail-', ''));
-      });
-      
-      var filterSelfIp = document.getElementById('filter-self-ip') ? document.getElementById('filter-self-ip').checked : true;
-      var filterAjax = document.getElementById('filter-ajax') ? document.getElementById('filter-ajax').checked : true;
-      var myIp = "<?= $ip ?>";
-      var localIps = ['127.0.0.1', '::1', 'WATCHER', 'SYS', '172.24.0.1']; 
-      
-      var tableHtml = '<tbody><tr><th style="width:70px">时间</th><th style="width:60px">状态</th><th style="width:110px">源 IP</th><th style="width:60px">方法</th><th>URI</th><th style="width:70px;text-align:center;">操作</th></tr>';
-      var esc = function(s) { return String(s||'').replace(/[&<>'"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]; }); };
-      
+      var hasNew = false;
       data.forEach(function(ev) {
-        var isAjax = ev.uri && (ev.uri.includes('waf_key='));
-        var isSelf = ev.ip === myIp || localIps.includes(ev.ip);
-
-        // 强行防风暴推入队列
-        if (_autoReapEnabled && !_processedIds.has(ev._id) && !isAjax && ev.ip !== 'WATCHER' && ev.ip !== 'SYS') {
-          _processedIds.add(ev._id);
-          if (_processedIds.size > 2000) { var iter = _processedIds.values(); _processedIds.delete(iter.next().value); }
-          var rawReqQ = (ev.method || 'GET') + ' ' + (ev.uri || '/') + " HTTP/1.1\nHost: {target}\nUser-Agent: " + (ev.ua || 'Mozilla/5.0');
-          if (ev.referer) rawReqQ += "\nReferer: " + ev.referer;
-          if (ev.method === 'POST') rawReqQ += "\nContent-Type: application/x-www-form-urlencoded";
-          if (ev.post) rawReqQ += "\n\n" + ev.post;
-          _autoReapQueue.push(rawReqQ);
+        if (!ftDataPool.find(function(item) { return item._id === ev._id; })) {
+          ftDataPool.push(ev);
+          hasNew = true;
+          
+          // 盲打逻辑：新流量推入队列 (必须强力过滤面板 ajax 以防死循环风暴)
+          var isAjax = ev.uri && (ev.uri.includes('waf_key='));
+          if (_autoReapEnabled && !_processedIds.has(ev._id) && !isAjax && ev.ip !== 'WATCHER' && ev.ip !== 'SYS') {
+            _processedIds.add(ev._id);
+            if (_processedIds.size > 2000) { var iter = _processedIds.values(); _processedIds.delete(iter.next().value); }
+            
+            var rawReqQ = (ev.method || 'GET') + ' ' + (ev.uri || '/') + " HTTP/1.1\nHost: {target}\n";
+            if (ev.ua) rawReqQ += "User-Agent: " + ev.ua + "\n";
+            if (ev.referer) rawReqQ += "Referer: " + ev.referer + "\n";
+            if (ev.method === 'POST') rawReqQ += "Content-Type: application/x-www-form-urlencoded\n";
+            if (ev.post) rawReqQ += "\n" + ev.post;
+            _autoReapQueue.push(rawReqQ);
+          }
         }
-
-        if (filterAjax && isAjax) return;
-        if (filterSelfIp && isSelf) return;
-
-        var ts = new Date((ev.ts || 0) * 1000);
-        var timeStr = String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0') + ':' + String(ts.getSeconds()).padStart(2,'0');
-        var isBlock = ev.action === 'block';
-        var statusBadge = isBlock ? '<span class="b br">拦截</span>' : '<span class="b bg">放行</span>';
-        
-        var rawReq = (ev.method || 'GET') + ' ' + (ev.uri || '/') + " HTTP/1.1\nHost: <?= $_SERVER['HTTP_HOST'] ?? 'unknown' ?>";
-        if (ev.ua) rawReq += "\nUser-Agent: " + ev.ua;
-        if (ev.referer) rawReq += "\nReferer: " + ev.referer;
-        if (ev.method === 'POST') rawReq += "\nContent-Type: application/x-www-form-urlencoded";
-        if (ev.post) rawReq += "\n\n" + ev.post;
-        
-        var detailHtml = '<div style="background:#030712;padding:12px;border-radius:6px;border:1px solid var(--border);font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;color:#e2e8f0;max-height:350px;overflow-y:auto;box-shadow:inset 0 0 10px rgba(0,0,0,0.5);">' + esc(rawReq) + '</div>';
-        if (isBlock) detailHtml += '<div style="margin-top:8px;padding:8px;background:rgba(220,38,38,0.1);border-left:3px solid #dc2626;color:#fca5a5;font-size:11px;"><b>[拦截触发]</b> 规则: <span class="b br">' + esc(ev.rule) + '</span> &nbsp;|&nbsp; <b>[恶意载荷]</b> ' + esc(ev.payload) + '</div>';
-
-        tableHtml += '<tr><td style="white-space:nowrap;color:var(--text2);">' + timeStr + '</td><td>' + statusBadge + '</td><td>' + esc(ev.ip) + '</td><td style="color:' + (ev.method==='POST'?'#f97316':'#38bdf8') + '">' + esc(ev.method) + '</td><td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(ev.uri) + '">' + esc(ev.uri) + '</td><td style="text-align:center;"><button type="button" class="btn bs" style="padding:2px 8px;" onclick="toggleTrafficDetail(\'' + ev._id + '\')">详情</button></td></tr>';
-        var displayStyle = expandedIds.has(ev._id) ? 'table-row' : 'none';
-        tableHtml += '<tr id="req-detail-' + ev._id + '" style="display:' + displayStyle + ';"><td colspan="6" style="padding:10px 16px;background:var(--card);">' + detailHtml + '</td></tr>';
       });
-      tableHtml += '</tbody>';
       
-      var tableEl = document.getElementById('full-traffic-table');
-      if (tableEl) tableEl.innerHTML = tableHtml;
+      if (hasNew) {
+        // 数据池按时间倒序，保持最大容量 1000 防止内存泄漏
+        ftDataPool.sort(function(a, b) { return b.ts - a.ts; });
+        if (ftDataPool.length > 1000) ftDataPool = ftDataPool.slice(0, 1000);
+        // 如果用户在看第一页才自动重绘，否则不打断用户往后翻页查看历史
+        if (ftPage === 1) renderFullTraffic();
+      }
+      
       var qCountEl = document.getElementById('auto-queue-count');
       if (qCountEl) qCountEl.textContent = _autoReapQueue.length;
       
@@ -3052,14 +3148,23 @@ setInterval(function() {
     }).catch(function(){});
 }, 2000); 
 
+// 盲打发包引擎
 async function processAutoReapQueue() {
   if (_autoReapProcessing || !_autoReapEnabled || _autoReapQueue.length === 0) return;
   _autoReapProcessing = true;
   
-  var ipStart = document.getElementById('auto-ip-start') ? document.getElementById('auto-ip-start').value.trim() : '';
-  var ipEnd = document.getElementById('auto-ip-end') ? document.getElementById('auto-ip-end').value.trim() : '';
-  var pStart = document.getElementById('auto-port-start') ? (parseInt(document.getElementById('auto-port-start').value) || 80) : 80;
-  var pEnd = document.getElementById('auto-port-end') ? (parseInt(document.getElementById('auto-port-end').value) || pStart) : 80;
+  var ipStartInput = document.querySelector('input[name="autoreap_ip_start"]');
+  var ipEndInput = document.querySelector('input[name="autoreap_ip_end"]');
+  var pStartInput = document.querySelector('input[name="autoreap_port_start"]');
+  var pEndInput = document.querySelector('input[name="autoreap_port_end"]');
+  
+  if (!ipStartInput || !ipEndInput) { _autoReapProcessing = false; return; }
+  
+  var ipStart = ipStartInput.value.trim();
+  var ipEnd = ipEndInput.value.trim();
+  var pStart = parseInt(pStartInput.value) || 80;
+  var pEnd = parseInt(pEndInput.value) || pStart;
+  
   if (!ipStart || !ipEnd) { _autoReapProcessing = false; return; }
   
   var startL = ip2long(ipStart), endL = ip2long(ipEnd);
@@ -3075,6 +3180,8 @@ async function processAutoReapQueue() {
 
     for (var i = startL; i <= endL && _autoReapEnabled; i++) {
       var targetIp = long2ip(i);
+      if (targetIp === myIpStr) continue;
+      
       for (var p = pStart; p <= pEnd && _autoReapEnabled; p++) {
         try {
           var resp = await fetch(window.location.href.split('?')[0] + '?waf_key=<?= urlencode($key) ?>&_replay=1', {
@@ -4116,3 +4223,6 @@ CSRC_BODY;
     echo "    + remove   - prevents remove() on protected files\n";
     echo "    + truncate - prevents truncating protected files to zero\n";
 }
+
+
+
