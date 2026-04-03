@@ -77,6 +77,7 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <errno.h>
+#include <sys/types.h>
 
 /* ── 可配置路径 (编译时 -D 覆盖) ── */
 
@@ -259,9 +260,9 @@ int rename(const char *oldpath, const char *newpath) {
 /* ═══════════════════════════════════════════════════════════════════════
  *  Hook: chmod — 禁止修改受保护文件权限
  * ═══════════════════════════════════════════════════════════════════════ */
-typedef int (*real_chmod_t)(const char *, unsigned int);
+typedef int (*real_chmod_t)(const char *, mode_t);
 
-int chmod(const char *pathname, unsigned int mode) {
+int chmod(const char *pathname, mode_t mode) {
     real_chmod_t real_chmod = (real_chmod_t)dlsym(RTLD_NEXT, "chmod");
     if (!real_chmod) { errno = EACCES; return -1; }
     if (is_protected(pathname)) {
@@ -291,9 +292,9 @@ int remove(const char *pathname) {
 /* ═══════════════════════════════════════════════════════════════════════
  *  Hook: truncate — 禁止截断受保护文件
  * ═══════════════════════════════════════════════════════════════════════ */
-typedef int (*real_truncate_t)(const char *, long);
+typedef int (*real_truncate_t)(const char *, off_t);
 
-int truncate(const char *path, long length) {
+int truncate(const char *path, off_t length) {
     real_truncate_t real_truncate = (real_truncate_t)dlsym(RTLD_NEXT, "truncate");
     if (!real_truncate) { errno = EACCES; return -1; }
     if (is_protected(path) && length == 0) {
