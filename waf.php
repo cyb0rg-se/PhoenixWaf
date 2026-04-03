@@ -1,6 +1,6 @@
 <?php
 /**
- * PhoenixWAF v3.0 — AWD PHP 最强通防
+ * PhoenixWAF v3.7 — AWD PHP 通防
  *
  * 部署: php waf.php --install /var/www/html [--password pass] [--key key]
  * 面板: http://host/any.php?waf_key=KEY  (需密码登录)
@@ -1500,7 +1500,7 @@ function pwaf_response_hook($out, array $cfg, $ip) {
     $fp = !empty($cfg['flagsub_regex'])
         ? '/' . str_replace('/', '\/', $cfg['flagsub_regex']) . '/'
         : '/' . $default_regex . '/i';
-    
+
     // Direct flag in output
     if (preg_match($fp, $out, $flagm)) {
         // 自动提交 flag
@@ -3889,13 +3889,45 @@ function pwaf_deploy_ldpreload($wr) {
         return;
     }
 
-    // ── Resolve paths via data directory system ──
-    $cfg_path = pwaf_cfg_path();
-    $cfg = file_exists($cfg_path) ? (include $cfg_path) : array();
-    $datadir  = pwaf_datadir($cfg);
-    if (!is_dir($datadir)) @mkdir($datadir, 0700, true);
+    // ── Resolve paths via data directory system ──────────────────────────────
+    $datadir = "";
+
+    // A. 暴力读取物理指针（最稳）
+    $ptr_file = $wr . '/.pwaf_ptr';
+    if (file_exists($ptr_file)) {
+        $ptr_name = trim(file_get_contents($ptr_file));
+        if ($ptr_name) {
+            $datadir = $wr . '/' . $ptr_name;
+        }
+    }
+
+    // B. 如果指针失效，直接扫描根目录下的随机隐藏文件夹（防死逻辑）
+    if (!$datadir || !is_dir($datadir)) {
+        $items = scandir($wr);
+        foreach ($items as $item) {
+            if ($item[0] === '.' && strlen($item) > 5 && is_dir($wr . '/' . $item)) {
+                if (file_exists($wr . '/' . $item . '/common.inc.php')) {
+                    $datadir = $wr . '/' . $item;
+                    break;
+                }
+            }
+        }
+    }
+
+    // C. 实在没辙了，才用 $wr
+    if (!$datadir) $datadir = $wr;
+
+    // 设置最终物理路径 (这里的变量名 $so_path 必须和下面编译命令里的保持一致)
     $so_path  = $datadir . '/waf.so';
-    $log_path = isset($cfg['log']) ? $cfg['log'] : ($datadir . '/.pwaf_log');
+    $log_path = $datadir . '/.sess_system_log';
+
+    // 5. 确保目录存在并设置最终路径
+    if (!is_dir($datadir)) @mkdir($datadir, 0700, true);
+    
+    $so_path  = $datadir . '/waf.so';
+    // 确保 C 代码里的日志路径也同步到随机目录内
+    $log_path = $datadir . '/.sess_system_log';
+
 
     // ── Detect architecture ──
     $arch = trim(@exec('uname -m 2>/dev/null'));
@@ -3916,7 +3948,18 @@ function pwaf_deploy_ldpreload($wr) {
     } else {
         echo "[*] No pre-compiled .so found at $precompiled\n";
     }
+    // 增加一个自动纠错逻辑：如果预编译的 so 无法在该系统执行，尝试现场编译
+    if ($deployed) {
+        // 简单测试一下 so 是否可用 (尝试执行 ls)
+        $test_cmd = "LD_PRELOAD=" . escapeshellarg($so_path) . " ls / 2>&1";
+        exec($test_cmd, $out, $ret);
 
+        // 如果返回包含 'not found' 或 'version' 关键字，说明 glibc 版本冲突
+        if (strpos(implode("\n", $out), "GLIBC") !== false) {
+            echo "[!] Pre-compiled .so incompatible with current GLIBC. Attempting local build...\n";
+            $deployed = false;
+        }
+    }
     // ── Strategy B: compile from embedded C source ──
     if (!$deployed) {
         echo "[*] Attempting on-host compilation...\n";
