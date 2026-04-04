@@ -1,6 +1,6 @@
 <?php
 /**
- * PhoenixWAF v3.7 — AWD PHP 通防
+ * PhoenixWAF v3.7.0 — AWD PHP WAF
  *
  * 部署: php waf.php --install /var/www/html [--password pass] [--key key]
  * 面板: http://host/any.php?waf_key=KEY  (需密码登录)
@@ -20,7 +20,7 @@
  *   L10 全局异常捕获 (任何错误都放行，不影响业务)
  */
 
-define('PWAF_VER',    '3.0.0');
+define('PWAF_VER',    '3.7.0');
 define('PWAF_MARKER', '/*PWAF*/');
 define('PWAF_SELF',   __FILE__);
 
